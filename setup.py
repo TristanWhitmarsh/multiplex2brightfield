@@ -7,7 +7,7 @@ long_description = (here / 'README.md').read_text(encoding='utf-8')
 
 setup(
     name='multiplex2brightfield',
-    version='0.1.0',
+    version='0.1.3',
     description='A package to convert a multiplex image to a virtual blightfield image such as H&E or IHC. Both the input and output are in OME-TIFF file format.',
     long_description=long_description,  # Add this to include the README.md content
     long_description_content_type='text/markdown',  # Specify the content type as Markdown
@@ -20,6 +20,12 @@ setup(
         'tifffile',
         'scikit-image',
         'numpy2ometiff',
+        'csbdeep',
+        'scikit-image',
+        'keras',
+        'pillow',
+        'SimpleITK',
+        'lxml',
     ],
     classifiers=[
         'Development Status :: 3 - Alpha',
