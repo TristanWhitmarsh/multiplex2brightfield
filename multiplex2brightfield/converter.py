@@ -1,897 +1,885 @@
-import os
-import re
-import json
-import numpy as np
-import tifffile
-from xml.etree import ElementTree as ET
-from csbdeep.utils import normalize
-from skimage.filters import gaussian, median
+import os  # Needed for os.remove(temp_output_path)
+import json  # Used to dump/print JSON (config, etc.)
+import math  # Used for math.ceil, math.floor
+import time  # Used for timing (time.time())
+import concurrent.futures  # Used for ThreadPoolExecutor
+
+import numpy as np  # Used in array operations, np.zeros, np.mean, etc.
+import tifffile  # Used to read TIFF files (tif.pages, tif.asarray())
+from xml.etree import ElementTree as ET  # Used for ET.fromstring(metadata)
+from csbdeep.utils import normalize  # Used for channel normalization
+from skimage.filters import gaussian, median, unsharp_mask
 from skimage.morphology import disk
-from skimage import exposure, io
-from skimage.io import imsave
-from keras.models import load_model
-from PIL import Image
+from skimage import exposure, io  # Used for histogram equalization, io.imread
+import SimpleITK as sitk  # Used for sitk.GetImageFromArray, etc.
+from lxml import etree  # Used for etree.fromstring(ome_metadata.encode('utf-8'))
+
+import configuration_presets  # For configuration_presets.GetConfiguration
 from numpy2ometiff import write_ome_tiff
-import SimpleITK as sitk
-from lxml import etree
-import requests
-from tqdm import tqdm
 
-def download_model():
-    url = 'https://path.to.your.storage/model.h5'
-    model_path = 'path/to/save/model.h5'
-    
-    if not os.path.exists(model_path):
-        print("Downloading model...")
-        response = requests.get(url, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
-        with open(model_path, 'wb') as f, tqdm(
-                desc=model_path,
-                total=total_size,
-                unit='B',
-                unit_scale=True,
-                unit_divisor=1024,
-        ) as bar:
-            for data in response.iter_content(chunk_size=1024):
-                bar.update(len(data))
-                f.write(data)
-    else:
-        print("Model already downloaded.")
-    return model_path
-
-def find_channels(channel_names, marker_channels):
-    """
-    Finds and returns channel names that match any marker channel name patterns provided.
-
-    Parameters:
-    - channel_names (list): A list of strings representing all channel names in the image.
-    - marker_channels (list): A list of strings representing the target marker names to search for.
-
-    Returns:
-    - list: A list of matching channel names from channel_names that match any of the patterns in marker_channels.
-    """
-    found_channels = []
-
-    # Preprocess marker channels by cleaning and creating flexible regex patterns
-    regex_patterns = []
-    for marker in marker_channels:
-        # Clean and create a pattern by removing non-alphanumeric characters and converting to lowercase
-        cleaned_marker = re.sub(r'[^a-zA-Z0-9]', '', marker.lower())
-        # Create a regex pattern to match any instance of the cleaned marker as a substring
-        pattern = re.compile(cleaned_marker, re.IGNORECASE)
-        regex_patterns.append(pattern)
-
-    # Search through channel names to find any matches
-    for name in channel_names:
-        # Clean the channel name in the same way for consistent matching
-        cleaned_name = re.sub(r'[^a-zA-Z0-9]', '', name.lower())
-
-        # Check if any pattern matches the cleaned channel name
-        if any(pattern.search(cleaned_name) for pattern in regex_patterns):
-            found_channels.append(name)
-
-    return found_channels
+# Local modules
+from utils import (
+    maybe_cleanup,
+    format_time_remaining,
+    resample_rgb_slices,
+    find_channels,
+    get_normalization_values,
+)
+from enhancement import EnhanceBrightfield
+from tiff_utils import (
+    get_image_metadata,
+    get_normalisation_values_from_center_crop,
+    add_pyramids_efficient_memmap,
+    add_pyramids_inmemory,
+)
+from llm_utils import query_llm_for_channels
 
 
-        
-def resample_rgb_slices(image_array, input_pixel_size_x, input_pixel_size_y, output_pixel_size_x, output_pixel_size_y, interpolation=sitk.sitkLinear):
-    """
-    Resamples each Z slice in a ZYXC NumPy array based on the input and output pixel sizes,
-    treating RGB channels as a multi-component image.
-
-    Args:
-    - image_array (np.array): Input array of shape (Z, Y, X, C) with dtype uint8.
-    - input_pixel_size_x (float): The input pixel size in the x direction.
-    - input_pixel_size_y (float): The input pixel size in the y direction.
-    - output_pixel_size_x (float): The desired output pixel size in the x direction.
-    - output_pixel_size_y (float): The desired output pixel size in the y direction.
-    - interpolation (SimpleITK Interpolator): Interpolation method for resampling.
-      Options include:
-      - sitk.sitkLinear (default)
-      - sitk.sitkNearestNeighbor
-      - sitk.sitkBSpline
-      - etc.
-
-    Returns:
-    - resampled_array (np.array): Resampled array of shape (Z, new_Y, new_X, C) with dtype uint8.
-    """
-    # Get the number of slices and channels
-    num_slices, height, width, channels = image_array.shape
-    assert channels == 3, "This function is designed for RGB images with 3 channels."
-    resampled_slices = []
-
-    # Loop over each Z slice
-    for z in range(num_slices):
-        # Extract the Z slice as an RGB image
-        rgb_slice = image_array[z, :, :, :]
-
-        # Convert the NumPy array to SimpleITK Image
-        sitk_image = sitk.GetImageFromArray(rgb_slice, isVector=True)
-
-        # Set the spacing (pixel size) for the input image
-        sitk_image.SetSpacing((input_pixel_size_x, input_pixel_size_y))
-
-        # Calculate the new size based on output pixel size
-        size = sitk_image.GetSize()
-        new_size = [
-            int(size[0] * (input_pixel_size_x / output_pixel_size_x)),
-            int(size[1] * (input_pixel_size_y / output_pixel_size_y))
-        ]
-
-        # Resample the image
-        resample_filter = sitk.ResampleImageFilter()
-        resample_filter.SetOutputSpacing((output_pixel_size_x, output_pixel_size_y))
-        resample_filter.SetSize(new_size)
-        resample_filter.SetInterpolator(interpolation)  # Use the specified interpolation method
-        resample_filter.SetDefaultPixelValue(0)
-
-        resampled_sitk_image = resample_filter.Execute(sitk_image)
-
-        # Convert back to NumPy array and append to list
-        resampled_rgb_slice = sitk.GetArrayFromImage(resampled_sitk_image)
-        resampled_slices.append(resampled_rgb_slice)
-
-    # Stack all the resampled slices along the Z dimension
-    resampled_array = np.stack(resampled_slices, axis=0)
-
-    return resampled_array
-
-def process_tile(tile, model):
-    # Preprocess the tile
-    tile = (tile - 127.5) / 127.5
-    tile = np.expand_dims(tile, 0)
-    
-    # Generate the image using the model
-    gen_tile = model.predict(tile, verbose=0)
-    
-    # Post-process the generated tile
-    gen_tile = gen_tile[0]
-    gen_tile = (gen_tile + 1) / 2.0
-    gen_tile = np.clip(gen_tile, 0, 1)
-    
-    # Convert to uint8 for RGB image
-    gen_tile_uint8 = (gen_tile * 255).astype(np.uint8)
-    
-    return gen_tile_uint8
-
-def process_image_with_tiling(image, model, tile_size=256, step_size=128):
-    h, w, _ = image.shape
-    processed_image = np.zeros((h, w, 3))
-    
-    for y in range(0, h - tile_size + 1, step_size):
-        for x in range(0, w - tile_size + 1, step_size):
-            # Extract tile
-            tile = image[y:y+tile_size, x:x+tile_size]
-            
-            # Process tile
-            processed_tile = process_tile(tile, model)
-            
-            # Extract center part
-            center_y, center_x = tile_size // 4, tile_size // 4
-            processed_center = processed_tile[center_y:center_y+step_size, center_x:center_x+step_size]
-            
-            # Place processed center into the result image
-            processed_image[y+center_y:y+center_y+step_size, x+center_x:x+center_x+step_size] = processed_center
-    
-    return processed_image.astype(np.uint8)
-
-
-
-def EnhanceBrightfield(input_image):
-    # Load the model
-    model = load_model('model.h5')
-
-    pad_size=256
-    
-    padded_image = np.pad(input_image, ((pad_size, pad_size), (pad_size, pad_size), (0, 0)), mode='reflect')
-
-    processed_padded_image = process_image_with_tiling(padded_image, model)
-
-    final_image = processed_padded_image[pad_size:-pad_size, pad_size:-pad_size]
-
-    return final_image
-
-
-
-
-def convert(input_filename, output_filename, reference_filename=[],
-    show_haematoxylin = True,
-    show_eosin1 = True,
-    show_eosin2 = True,
-    show_blood = True,
-    show_marker = False,
-    marker = None,
-    use_chatgpt = True,
-    use_gemini = False,
-    use_claude = False,
-    use_haematoxylin_histogram_normalisation = True,
-    use_eosin_histogram_normalisation = True,
-    histogram_matching = False,
-    channel_names=[], 
-    pixel_size_x=1, 
-    pixel_size_y=1, 
-    physical_size_z=1, 
-    imagej=False, 
-    create_pyramid=True, 
-    compression='zlib', 
-    Unit='µm', 
-    downsample_count=4, 
-    apply_filter = False,
+def convert_from_file(
+    input_filename,
+    output_filename=None,
+    use_chatgpt=False,
+    use_gemini=False,
+    use_claude=False,
+    input_pixel_size_x=None,
+    input_pixel_size_y=None,
+    input_physical_size_z=None,
+    imagej=False,
+    create_pyramid=True,
+    compression="zlib",
+    Unit="µm",
+    downsample_count=4,
     filter_settings=None,
     AI_enhancement=False,
-    output_pixel_size_x = None,
-    output_pixel_size_y = None,
-    output_physical_size_z = None,
-    api_key = ''):
+    output_pixel_size_x=None,
+    output_pixel_size_y=None,
+    output_physical_size_z=None,
+    channel_names=None,
+    stain="",
+    custom_palette=None,
+    api_key="",
+    config=None,
+    normalization_values=None,
+    intensity=1.0,
+    median_filter_size=0,
+    gaussian_filter_sigma=0,
+    sharpen_filter_amount=0,
+    histogram_normalisation=False,
+    clip=None,
+    normalize_percentage_min=10,
+    normalize_percentage_max=90,
+    process_tiled=False,
+    tile_size=8192,
+    use_memmap=False,
+):
+    """
+    Convert a multiplex image from an OME-TIFF file to a virtual brightfield image.
 
+    This function reads a multiplex image stored in an OME-TIFF file and processes it to generate a 
+    virtual brightfield image (e.g., simulating H&E or IHC staining). It supports both full image processing 
+    and tiled processing (useful for very large images). Various processing steps are applied including 
+    channel identification, normalization, filtering, and optional AI enhancement. Multi-resolution pyramid 
+    generation is also supported for efficient visualization.
 
-    # Default filter settings if none are provided
-    if apply_filter:
-        print("Applying filter")
-        default_filter_settings = {
-            "blue": {"median_filter_size": 1, "gaussian_filter_sigma": 0},
-            "pink": {"median_filter_size": 2, "gaussian_filter_sigma": 0.5},
-            "purple": {"median_filter_size": 2, "gaussian_filter_sigma": 1},
-            "red": {"median_filter_size": 1, "gaussian_filter_sigma": 0},
-            "brown": {"median_filter_size": 2, "gaussian_filter_sigma": 1}
-        }
-    else:
-        default_filter_settings = {
-            "blue": {"median_filter_size": 0, "gaussian_filter_sigma": 0},
-            "pink": {"median_filter_size": 0, "gaussian_filter_sigma": 0},
-            "purple": {"median_filter_size": 0, "gaussian_filter_sigma": 0},
-            "red": {"median_filter_size": 0, "gaussian_filter_sigma": 0},
-            "brown": {"median_filter_size": 0, "gaussian_filter_sigma": 0}
-        }
+    Args:
+        input_filename (str): Path to the input OME-TIFF multiplex image.
+        output_filename (str, optional): Path for saving the output OME-TIFF virtual brightfield image.
+        use_chatgpt (bool): Enable ChatGPT-based configuration for channel mapping.
+        use_gemini (bool): Enable Gemini-based configuration for channel mapping.
+        use_claude (bool): Enable Claude-based configuration for channel mapping.
+        input_pixel_size_x (float, optional): X-axis pixel size of the input image. Defaults to 1.
+        input_pixel_size_y (float, optional): Y-axis pixel size of the input image. Defaults to 1.
+        input_physical_size_z (float, optional): Z-axis physical size of the input image. Defaults to 1.
+        imagej (bool): Flag to indicate if ImageJ compatibility is required.
+        create_pyramid (bool): If True, generate multi-resolution pyramid levels in the output image.
+        compression (str): Compression method to use (default "zlib").
+        Unit (str): Unit for the pixel sizes (default "µm").
+        downsample_count (int): Number of pyramid levels to generate.
+        filter_settings (dict, optional): Custom filter settings overriding defaults.
+        AI_enhancement (bool): If True, apply deep learning-based enhancement to the output image.
+        output_pixel_size_x (float, optional): Desired output pixel size in X direction.
+        output_pixel_size_y (float, optional): Desired output pixel size in Y direction.
+        output_physical_size_z (float, optional): Desired output physical size in Z direction.
+        channel_names (list of str, optional): List of channel names extracted from the image.
+        stain (str): Name of the stain preset to use (e.g., "H&E", "IHC").
+        custom_palette (optional): Custom color palette for stain simulation.
+        api_key (str): API key for the LLM service used for channel configuration.
+        config (dict, optional): Custom configuration dictionary for the stain.
+        normalization_values (dict, optional): Precomputed normalization values for the channels.
+        intensity (float): Scaling factor for the intensity of stain components.
+        median_filter_size (int): Size of the median filter kernel for noise reduction.
+        gaussian_filter_sigma (float): Sigma value for Gaussian smoothing.
+        sharpen_filter_amount (float): Amount of sharpening to apply.
+        histogram_normalisation (bool): If True, perform histogram normalization on channels.
+        clip (tuple or None): Value range for clipping channel intensities.
+        normalize_percentage_min (int): Lower percentile for intensity normalization.
+        normalize_percentage_max (int): Upper percentile for intensity normalization.
+        process_tiled (bool): If True, process the image in smaller tiles.
+        tile_size (int): Size (in pixels) for each tile when processing tiled.
+        use_memmap (bool): If True, employ memory mapping for handling large images.
 
-    # Merge user-provided filter settings with the default ones
-    if filter_settings is not None:
-        for key in default_filter_settings:
-            if key in filter_settings:
-                default_filter_settings[key].update(filter_settings[key])
-
-    filter_settings = default_filter_settings
-
-    # Extract individual filter settings
-    blue_median_filter_size = filter_settings["blue"]["median_filter_size"]
-    blue_gaussian_filter_sigma = filter_settings["blue"]["gaussian_filter_sigma"]
-
-    pink_median_filter_size = filter_settings["pink"]["median_filter_size"]
-    pink_gaussian_filter_sigma = filter_settings["pink"]["gaussian_filter_sigma"]
-
-    purple_median_filter_size = filter_settings["purple"]["median_filter_size"]
-    purple_gaussian_filter_sigma = filter_settings["purple"]["gaussian_filter_sigma"]
-
-    red_median_filter_size = filter_settings["red"]["median_filter_size"]
-    red_gaussian_filter_sigma = filter_settings["red"]["gaussian_filter_sigma"]
-
-    brown_median_filter_size = filter_settings["brown"]["median_filter_size"]
-    brown_gaussian_filter_sigma = filter_settings["brown"]["gaussian_filter_sigma"]
-    
-        
-    haematoxylin_list = [
-        'DNA', 'DAPI', 'hoechst', 'hoechst 33342', 'hoechst 2', 'hoechst stain', 'Iridium', 
-        'Iridium-191', 'Iridium-193', 'Ir191', 'Ir193', 'Iridium_10331253Ir191Di', 
-        'Iridium_10331254Ir193Di', 'H3', 'H4', 'H3K27me3', 'H3K9me3',
-        # 'Histone', 'Histone_1261726In113Di', 'Histone_473968La139Di'
-    ]
-
-    pink_eosin_list = [
-        'Col1A1', 'Col3A1', 'Col4A1', 'Col I', 'Col III', 'Col IV', 'Collagen I', 'Collagen III', 
-        'Collagen IV', 'FN', 'Fibronectin', 'Fibrone', 'VIM', 'Vimentin', 'Vimenti', 'aSMA', 
-        'SMA', 'smooth muscle actin', 'CD31', 'PECAM1', 'PECAM-1', 'Desmin', 'Laminin', 
-        'Actin', 'eosin', 'stroma', 'Keratin'
-    ]
-    
-    purple_eosin_list = [
-        'panCK', 'panCyto', 'pancytokeratin', 'cytokeratin', 'Pan-Cytokeratin', 'CK7', 'CK20', 'CAV1', 'Caveolin-1', 'AQP1', 
-        'Aquaporin-1', 'EPCAM', 'EpCAM', 'epithelial cell adhesion molecule', 
-        'E-cadherin', 'P-cadherin', 'Cadherin', 'MUC1', 'S100', 'epithelium'
-    ]
-    
-    blood_list = [
-        'Ter119', 'Ter-119', 'Ter 119', 'CD235a', 'Glycophorin A', 'erythrocyte marker'
-    ]
-    
-    if marker is None:
-        marker_list = [
-            'CD3',    # T-cell marker
-            'CD4',    # Helper T-cell marker
-            'CD8',    # Cytotoxic T-cell marker
-            'CD20',   # B-cell marker
-            'CD45',   # Pan-leukocyte marker
-            'CD68',   # Macrophage marker
-            'CD56',   # NK cell marker
-            'CD57',   # NK cell subset marker
-            'CD11b',  # Myeloid cell marker, monocytes/macrophages
-            'CD11c',  # Dendritic cell marker, also on monocytes
-            'CD163',  # M2 macrophage marker
-            'CD38',   # Activation marker on B-cells, T-cells, and plasma cells
-            'CD25',   # Activation marker on T-cells (IL-2 receptor)
-            'CD44',   # Adhesion molecule, often used in stem cells and immune cells
-            'CD62L',  # L-selectin, adhesion molecule on leukocytes
-            'CD40',   # Activation marker on B-cells and APCs (Antigen Presenting Cells)
-            'CD279',  # PD-1, checkpoint protein on T-cells
-            'CD127',  # IL-7 receptor, used to mark memory T-cells
-            'FOXP3',  # Regulatory T-cell marker (Tregs)
-            'CD21',   # Follicular dendritic cell and mature B-cell marker
-            'CD15',   # Granulocyte marker, especially neutrophils
-            'CD138',  # Plasma cell marker
-            'CD5',    # T-cell and some B-cell subset marker
-            'CD30',   # Activation marker on B-cells and T-cells, often used in lymphoma
-            'CD10',   # Marker for germinal center B-cells and some leukemias
-            'CD23',   # Activated B-cell and dendritic cell marker
-            'CD31',   # PECAM-1, endothelial cell marker (blood vessels)
-            'CD34',   # Hematopoietic stem cell and endothelial progenitor marker
-            'CD1a',   # Langerhans cells and cortical thymocyte marker
-            'BCL2',   # Anti-apoptotic protein, often used in B-cells and tumors
-            'Ki67',   # Proliferation marker (marks cells in the cell cycle)
-            'p53',    # Tumor suppressor protein, often used in cancer studies
-            'S100',   # Used for neural cells, dendritic cells, and melanocytes
-            'E-cadherin', # Cell adhesion protein, used in epithelial and some cancer studies
-            'PD-L1',  # Immune checkpoint ligand, often used in cancer and immune studies
-            'MHCII',  # Major Histocompatibility Complex II, on antigen-presenting cells
-            'CD14',   # Monocyte and macrophage marker
-            'CD1c',   # Dendritic cell marker
-            'CD138',  # Syndecan-1, often used to identify plasma cells
-            'ARG1',   # Arginase-1, marker of M2 macrophages
-            'GLUT1',  # Glucose transporter, often upregulated in tumors
-            'Ly6G',   # Marker for neutrophils and granulocytes
-            'Granzyme B', # Cytotoxic marker in NK cells and cytotoxic T-cells
-            'F4/80',  # Macrophage marker commonly used in mouse studies
-            'TCRγδ',  # Gamma delta T-cell receptor marker
-            'CD209',  # DC-SIGN, dendritic cell marker
-            'Lyve-1', # Lymphatic vessel marker
-            'ICOS',   # Inducible T-cell co-stimulator, marker of activated T-cells
-            'GATA3',  # Transcription factor, often used to identify Th2 cells and some epithelial cells
-            'ER',     # Estrogen receptor, common in breast tissue studies
-            'PR',     # Progesterone receptor, common in breast tissue studies
-            'HER2',   # Human epidermal growth factor receptor 2, common in breast cancer studies
-            'MUC1',   # Mucin-1, common in epithelial and cancer cells
-        ]
-    else:
-        marker_list = [marker]
-    
-
-    
-    
-    
-    
-    
-    # Load the TIFF file and get the metadata
-    with tifffile.TiffFile(input_filename) as tif:
-        ome_metadata = tif.ome_metadata
-        imc_image = tif.asarray()
-        metadata = tif.pages[0].tags['ImageDescription'].value
-
-    # Parse XML metadata using lxml
-    root = etree.fromstring(ome_metadata.encode('utf-8'))
-
-    # Find the Pixels element using a wildcard for the namespace
-    pixels = root.find('.//{*}Pixels')
-
-    if pixels is not None:
-        # Extracting the attributes
-        input_pixel_size_x = float(pixels.get('PhysicalSizeX', 1))
-        input_pixel_size_y = float(pixels.get('PhysicalSizeY', 1))
-        input_physical_size_z = float(pixels.get('PhysicalSizeZ', 1))
-    else:
-        # Fallback if the <Pixels> element is not found in the XML
+    Returns:
+        numpy.ndarray: The processed virtual brightfield image data, transposed appropriately for OME-TIFF writing.
+    """
+    if input_pixel_size_x is None:
         input_pixel_size_x = 1
+    if input_pixel_size_y is None:
         input_pixel_size_y = 1
+    if input_physical_size_z is None:
         input_physical_size_z = 1
-    
-       
+
+    if process_tiled:
+
+        with tifffile.TiffFile(input_filename) as tif:
+            shape = tif.pages[0].shape
+            height, width = shape[:2]
+            if len(tif.pages) == 1 and len(shape) >= 3:
+                n_channels = shape[2]
+                multi_page = False
+            else:
+                n_channels = len(tif.pages)
+                multi_page = True
+            pixel_sizes, channel_names = get_image_metadata(tif, multi_page, n_channels)
+
+        print(
+            f"Image dimensions: {width}x{height} pixels, Channels: {n_channels}, Pixel sizes: {pixel_sizes}"
+        )
+
+        scale_x = pixel_sizes["x"] / output_pixel_size_x
+        scale_y = pixel_sizes["y"] / output_pixel_size_y
+        scaled_width = int(round(width * scale_x))
+        scaled_height = int(round(height * scale_y))
+        print(f"Scaling factors: {scale_x:.3f}, {scale_y:.3f}")
+        print(f"Scaled dimensions: {scaled_width}x{scaled_height}")
+
+        n_tiles_x = math.ceil(scaled_width / tile_size)
+        n_tiles_y = math.ceil(scaled_height / tile_size)
+        total_tiles = n_tiles_x * n_tiles_y
+
+        # print("Channel names: ", channel_names)
+
+        norm_values = get_normalisation_values_from_center_crop(input_filename)
+
+        # Conditional allocation of the output array.
+        if use_memmap:
+            temp_output_path = "temp_output.dat"
+            output_array = np.memmap(
+                temp_output_path,
+                dtype=np.uint8,
+                mode="w+",
+                shape=(scaled_height, scaled_width, 3),
+            )
+            output_array[:] = 0  # Initialize to zero.
+        else:
+            output_array = np.zeros((scaled_height, scaled_width, 3), dtype=np.uint8)
+
+        processed_tiles = 0
+        processing_start_time = time.time()
+
+        for ty in range(n_tiles_y):
+            for tx in range(n_tiles_x):
+                tile_data = process_single_tile(
+                    tx,
+                    ty,
+                    tile_size,
+                    height,
+                    width,
+                    input_filename,
+                    n_channels,
+                    channel_names,
+                    config,
+                    norm_values,
+                    pixel_sizes,
+                    output_pixel_size_x,
+                    output_pixel_size_y,
+                    multi_page,
+                )  # shape: (3, tile_h, tile_w)
+                # Transpose to interleaved (tile_h, tile_w, 3)
+                tile_data = tile_data.transpose(1, 2, 0)
+                y_start = ty * tile_size
+                x_start = tx * tile_size
+                y_end = min((ty + 1) * tile_size, scaled_height)
+                x_end = min((tx + 1) * tile_size, scaled_width)
+                output_array[y_start:y_end, x_start:x_end, :] = tile_data
+
+                processed_tiles += 1
+                elapsed_time = time.time() - processing_start_time
+                tiles_per_second = (
+                    processed_tiles / elapsed_time if elapsed_time > 0 else 0
+                )
+                remaining_tiles = total_tiles - processed_tiles
+                estimated_time_remaining = (
+                    remaining_tiles / tiles_per_second if tiles_per_second > 0 else 0
+                )
+
+                print(
+                    f"\rProgress: {processed_tiles}/{total_tiles} tiles "
+                    f"({processed_tiles / total_tiles * 100:.1f}%) - "
+                    f"Speed: {tiles_per_second:.2f} tiles/sec - "
+                    f"Est. remaining: {format_time_remaining(estimated_time_remaining)}",
+                    end="",
+                    flush=True,
+                )
+
+                del tile_data
+                maybe_cleanup()
+
+        if use_memmap:
+            output_array.flush()
+
+        # Prepare metadata for the base image.
+        base_metadata = {
+            "PhysicalSizeX": output_pixel_size_x,
+            "PhysicalSizeY": output_pixel_size_y,
+            "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeYUnit": "µm",
+        }
+
+        print("\nWriting pyramid levels...")
+        if use_memmap:
+            # Pyramid generation without loading the full image into memory.
+            add_pyramids_efficient_memmap(
+                input_memmap_path=temp_output_path,
+                output_path=output_filename,
+                shape=(scaled_height, scaled_width, 3),
+                num_levels=downsample_count,
+                tile_size=1024,
+                base_metadata=base_metadata,
+            )
+        else:
+            # Load full image into memory and generate pyramid levels.
+            base_image = np.array(output_array)  # already in shape (H, W, 3)
+            add_pyramids_inmemory(
+                base_image,
+                output_path=output_filename,
+                num_levels=downsample_count,
+                tile_size=1024,
+                base_metadata=base_metadata,
+            )
+
+        if use_memmap:
+            # Clean up the temporary base image memmap.
+            del output_array
+            os.remove(temp_output_path)
+        maybe_cleanup()
+
+    else:
+        # Load the TIFF file and get the metadata
+        with tifffile.TiffFile(input_filename) as tif:
+            imc_image = tif.asarray()
+            metadata = tif.pages[0].tags["ImageDescription"].value
+            try:
+                ome_metadata = tif.ome_metadata
+                if ome_metadata:  # Ensure metadata is not None
+                    # Parse XML metadata using lxml
+                    root = etree.fromstring(ome_metadata.encode("utf-8"))
+
+                    # Find the Pixels element using a wildcard for the namespace
+                    pixels = root.find(".//{*}Pixels")
+
+                    if pixels is not None:
+                        # Extracting the attributes
+                        input_pixel_size_x = float(pixels.get("PhysicalSizeX", 1))
+                        input_pixel_size_y = float(pixels.get("PhysicalSizeY", 1))
+                        input_physical_size_z = float(pixels.get("PhysicalSizeZ", 1))
+
+                    # Extract channel names
+                    ns_uri = root.tag.split("}")[0].strip("{")
+                    ns = {"ome": ns_uri}
+
+                    root = ET.fromstring(metadata)
+                    channel_elements = root.findall(".//ome:Channel", ns)
+
+                    if channel_names is None:  # Use provided channel_names if available
+                        channel_names = [
+                            channel.get("Name")
+                            for channel in channel_elements
+                            if channel.get("Name")
+                        ]
+                else:
+                    print(f"Warning: OME metadata is missing in {input_filename}.")
+            except Exception as e:
+                print(
+                    f"Warning: Failed to extract metadata for {input_filename}. Error: {e}"
+                )
+                # Use default values for pixel sizes and an empty channel list if no metadata
+                if channel_names is None:
+                    channel_names = channel_names if channel_names else []
+
+        # Elegant printing of the input and output pixel sizes
+        print(f"Input Pixel Size X: {input_pixel_size_x}")
+        print(f"Input Pixel Size Y: {input_pixel_size_y}")
+        print(f"Input Physical Size Z: {input_physical_size_z}")
+        print(f"Output Pixel Size X: {output_pixel_size_x}")
+        print(f"Output Pixel Size Y: {output_pixel_size_y}")
+        print(f"Output Physical Size Z: {output_physical_size_z}")
+
+        if imc_image.ndim == 3:
+            imc_image = np.expand_dims(imc_image, axis=0)
+            print(imc_image.shape)  # The shape will now be (1, height, width, channels)
+
+        print("Data size: ", imc_image.shape)
+        print("Image size: ", imc_image.shape[2:4])
+        print("Number of channels: ", imc_image.shape[1])
+        print("Number of slices: ", imc_image.shape[0])
+        # print("Channel names: ", channel_names)
+
+        if normalization_values is None:
+            normalization_values = get_normalization_values(
+                imc_image,
+                channel_names,
+                percentile_min=normalize_percentage_min,
+                percentile_max=normalize_percentage_max,
+            )
+
+        return convert(
+            imc_image,
+            output_filename=output_filename,
+            input_pixel_size_x=input_pixel_size_x,
+            input_pixel_size_y=input_pixel_size_y,
+            input_physical_size_z=input_physical_size_z,
+            use_chatgpt=use_chatgpt,
+            use_gemini=use_gemini,
+            use_claude=use_claude,
+            imagej=imagej,
+            create_pyramid=create_pyramid,
+            compression=compression,
+            Unit=Unit,
+            downsample_count=downsample_count,
+            filter_settings=filter_settings,
+            AI_enhancement=AI_enhancement,
+            output_pixel_size_x=output_pixel_size_x,
+            output_pixel_size_y=output_pixel_size_y,
+            output_physical_size_z=output_physical_size_z,
+            channel_names=channel_names,
+            stain=stain,
+            custom_palette=custom_palette,
+            api_key=api_key,
+            config=config,
+            normalization_values=normalization_values,
+            intensity=intensity,
+            median_filter_size=median_filter_size,
+            gaussian_filter_sigma=gaussian_filter_sigma,
+            sharpen_filter_amount=sharpen_filter_amount,
+            histogram_normalisation=histogram_normalisation,
+            clip=clip,
+            normalize_percentage_min=normalize_percentage_min,
+            normalize_percentage_max=normalize_percentage_max,
+        )
+
+
+def convert(
+    imc_image,
+    output_filename,
+    use_chatgpt=False,
+    use_gemini=False,
+    use_claude=False,
+    input_pixel_size_x=1,
+    input_pixel_size_y=1,
+    input_physical_size_z=1,
+    imagej=False,
+    create_pyramid=True,
+    compression="zlib",
+    Unit="µm",
+    downsample_count=8,
+    filter_settings=None,
+    AI_enhancement=False,
+    output_pixel_size_x=None,
+    output_pixel_size_y=None,
+    output_physical_size_z=None,
+    channel_names=None,
+    stain="",
+    custom_palette=None,
+    api_key="",
+    config=None,
+    normalization_values=None,
+    intensity=1.0,
+    median_filter_size=0,
+    gaussian_filter_sigma=0,
+    sharpen_filter_amount=0,
+    histogram_normalisation=False,
+    clip=None,
+    normalize_percentage_min=10,
+    normalize_percentage_max=90,
+):
+    """
+    Convert a multiplex image (as an array) to a virtual brightfield image.
+
+    This function takes in the multiplex image data (typically as a NumPy array) along with various 
+    processing parameters and configuration options, applies channel mapping, filtering, normalization, 
+    and optional AI-enhancement to produce a virtual brightfield image. The output image is prepared 
+    for saving in OME-TIFF format.
+
+    Args:
+        imc_image (numpy.ndarray): The multiplex image as a NumPy array, typically of shape 
+            (n_slices, n_channels, height, width).
+        output_filename (str): Path where the output virtual brightfield image will be saved.
+        use_chatgpt (bool): Enable configuration via ChatGPT-based LLM for channel mapping.
+        use_gemini (bool): Enable configuration via Gemini-based LLM for channel mapping.
+        use_claude (bool): Enable configuration via Claude-based LLM for channel mapping.
+        input_pixel_size_x (float): Pixel size in the X direction of the input image.
+        input_pixel_size_y (float): Pixel size in the Y direction of the input image.
+        input_physical_size_z (float): Physical size in the Z direction of the input image.
+        imagej (bool): Flag for adapting output for ImageJ.
+        create_pyramid (bool): If True, generate a multi-resolution pyramid in the output.
+        compression (str): Compression method used for the output image.
+        Unit (str): Unit of measurement for physical sizes (e.g., "µm").
+        downsample_count (int): Number of pyramid levels to generate.
+        filter_settings (dict, optional): Custom filtering settings.
+        AI_enhancement (bool): If True, apply deep learning-based enhancement to the output.
+        output_pixel_size_x (float, optional): Desired output pixel size in the X direction.
+        output_pixel_size_y (float, optional): Desired output pixel size in the Y direction.
+        output_physical_size_z (float, optional): Desired output physical size in the Z direction.
+        channel_names (list of str, optional): List of channel names from the multiplex image.
+        stain (str): The stain preset name to use (e.g., "H&E", "IHC").
+        custom_palette (optional): Custom color palette for the stain simulation.
+        api_key (str): API key for LLM-based configuration.
+        config (dict, optional): Custom configuration dictionary for stain simulation.
+        normalization_values (dict, optional): Precomputed normalization values.
+        intensity (float): Intensity scaling factor for the stain components.
+        median_filter_size (int): Size of the median filter kernel.
+        gaussian_filter_sigma (float): Sigma for Gaussian smoothing.
+        sharpen_filter_amount (float): Amount of sharpening to apply.
+        histogram_normalisation (bool): If True, perform histogram normalization.
+        clip (tuple or None): Clipping range for intensity values.
+        normalize_percentage_min (int): Lower percentile for normalization.
+        normalize_percentage_max (int): Upper percentile for normalization.
+
+    Returns:
+        numpy.ndarray: The processed virtual brightfield image data, transposed for OME-TIFF output.
+    """
+
+    if reference_filename is None:
+        reference_filename = []
+
+    if config is None and not (use_chatgpt or use_gemini or use_claude):
+        config = configuration_presets.GetConfiguration(stain)
+
+    if use_chatgpt or use_gemini or use_claude:
+        if config is None and stain != "":
+            config = {
+                "name": stain,
+            }
+
+        config = query_llm_for_channels(
+            config,
+            channel_names,
+            intensity=intensity,
+            median_filter_size=median_filter_size,
+            gaussian_filter_sigma=gaussian_filter_sigma,
+            sharpen_filter_amount=sharpen_filter_amount,
+            histogram_normalisation=histogram_normalisation,
+            clip=clip,
+            normalize_percentage_min=normalize_percentage_min,
+            normalize_percentage_max=normalize_percentage_max,
+            use_chatgpt=use_chatgpt,
+            use_gemini=use_gemini,
+            use_claude=use_claude,
+            api_key=api_key,
+        )
+        print(f"{json.dumps(config, indent=4)}\n\n")
+
+    # stain_name, config = next(iter(config.items()))
+
+    # print(f"Stain name: {stain_name}")
+
     if not output_pixel_size_x:
         output_pixel_size_x = input_pixel_size_x
     if not output_pixel_size_y:
         output_pixel_size_y = input_pixel_size_y
     if not output_physical_size_z:
         output_physical_size_z = input_physical_size_z
-    
-    # Elegant printing of the input and output pixel sizes
-    print(f"Input Pixel Size X: {input_pixel_size_x}")
-    print(f"Input Pixel Size Y: {input_pixel_size_y}")
-    print(f"Input Physical Size Z: {input_physical_size_z}")
-    print(f"Output Pixel Size X: {output_pixel_size_x}")
-    print(f"Output Pixel Size Y: {output_pixel_size_y}")
-    print(f"Output Physical Size Z: {output_physical_size_z}")
-    
-    if imc_image.ndim == 3:
-        imc_image = np.expand_dims(imc_image, axis=0)
-        print(imc_image.shape)  # The shape will now be (1, height, width, channels)
-
-    # print("Data size: ", imc_image.shape)
-    imc_image = imc_image[0:1, ...]
-
-    print("Data size: ", imc_image.shape)
-    print("Image size: ", imc_image.shape[2:4])
-    print("Number of channels: ", imc_image.shape[0])
-
-    # Determine namespace based on the XML root's namespace
-    ns_uri = root.tag.split('}')[0].strip('{')
-    ns = {'ome': ns_uri}
-
-    root = ET.fromstring(metadata)
-    channel_elements = root.findall('.//ome:Channel', ns)
-    channel_names = [channel.get('Name') for channel in channel_elements if channel.get('Name')]
-
-    print("Channel names: ", channel_names)
-    
-    
-    
 
     # Channel names provided
-    channel_names_string = ', '.join(channel_names)
-    
-    content = "Consider the following channels in a multiplexed image: " + channel_names_string + \
-        " I want to convert this multiplexed image into a pseudo H&E image." + \
-        " Which channels would be shown as blue, pink or purple in an H&E image, and which are shown as red (red blood cells)?" + \
-        '''
-        
-        Pink
-        For simulating the pink appearance in a pseudo H&E image using multiplexed imaging like Imaging Mass Cytometry (IMC),
-        focus on channels that tag proteins predominantly located in the cytoplasm and extracellular matrix.
-        These are areas where eosin, which stains acidic components of the cell such as proteins, typically binds in traditional H&E staining.
-        Proteins like collagen, which is a major component of the extracellular matrix, and fibronectin, another matrix protein,
-        are ideal for this purpose. Additionally, cytoplasmic proteins such as cytokeratins in epithelial cells and muscle actin in muscle tissues would also appear pink,
-        reflecting their substantial protein content and eosinophilic properties. It should not include markers that only stain the nucleus. Only include markers that predominantly stain the **cytoplasm or extracellular matrix (ECM)** and do not overlap significantly with nuclear components. This includes proteins like smooth muscle actin (SMA) and fibronectin, which are primarily found in the cytoplasm and cytoskeleton of cells without creating a dense, nuclear-interacting appearance.
+    # channel_names_string = ", ".join(channel_names)
+    # prompt_text = config.get("prompt", "")
+    # prompt = "Consider the following markers in a multiplexed image: " + channel_names_string + prompt_text
 
-        Purple:
-        For achieving a purple hue, the approach involves selecting channels that label proteins found both in the nucleus and in the cytoplasm,
-        or at their interface. It includes markers associated with epithelial cells and other specific dense structures, giving a purple hue due to the density and nature of these proteins.
-        This color is typically seen where there is a merging of the blue nuclear staining and the pink cytoplasmic staining.
-        Intermediate filament proteins like cytokeratins, which are densely packed in the cytoplasm, and vimentin, common in mesenchymal cells, are key targets.
-        Membrane proteins such as Caveolin-1, which is localized to the plasma membrane, can also contribute to this effect.
-        These proteins, due to their strategic locations and the properties of the tagged antibodies used,
-        allow for a nuanced blending of blue and pink, creating the purple appearance commonly observed in regions of cell-cell interaction or dense cytoplasmic content in traditional H&E staining. It should not include markers that only stain the nucleus. Select markers found in **densely packed or epithelial cell structures** where there is a clear interaction between nuclear and cytoplasmic staining, creating a purple effect. Avoid including cytoplasmic-only proteins like SMA in this category, as they contribute to an overall pink appearance without significant nuclear overlap.
+    # print("Channel names: ", channel_names_string)
 
-        Red:
-        For highlighting red blood cells with vivid red, choosing the right markers is crucial.
-        Ter119 is an ideal choice, as it specifically targets a protein expressed on the surface of erythroid cells in mice, from early progenitors to mature erythrocytes.
-        This marker, when conjugated with a metal isotope, allows for precise visualization of red blood cells within tissue sections.
-        To simulate the red appearance typical of eosin staining in traditional histology,
-        Ter119 can be assigned a bright red color in the image analysis software.
-        Additionally, targeting hemoglobin with a specific antibody can also serve as an alternative or complementary approach,
-        as hemoglobin is abundant in red blood cells and can be visualized similarly by assigning a red color to its corresponding channel.
-        Both strategies ensure that red blood cells stand out distinctly in the IMC data,
-        providing a clear contrast to other cellular components and mimicking the traditional histological look.
-
-        Here are some specific examples:
-        
-        Markers for cell nuclei (Blue hematoxylin):
-        DNA: this is a standard nuclear stain.
-        DAPI: DAPI binds directly to DNA, staining all nuclei.
-        Histone: histones are universal nuclear proteins, staining nuclei broadly.
-        Iridium: iridium markers (e.g., Iridium_10331253Ir191Di, Iridium_10331254Ir193Di) intercalate with DNA, staining all nuclei.
-        hoechst: Hoechst stains DNA universally in nuclei.
-
-        Markers typically staining the cytoplasm, cytoskeletal elements, or ECM (Pink Eosin):
-        Collagen (Col1A1, Col3A1, Col4A1): Collagens are major components of the ECM and appear pink in H&E staining.
-        Fibronectin (FN): An ECM glycoprotein that helps in cell adhesion and migration, typically stained pink.
-        Vimentin (VIM): An intermediate filament protein found in mesenchymal cells, contributes to the cytoplasmic structure, often stained pink.
-        smooth muscle actin (aSMA, SMA): Found in smooth muscle cells, it stains the cytoplasm and is often observed in connective tissue.
-        CD31 (PECAM-1): Found on endothelial cells lining the blood vessels; staining can reveal the cytoplasmic extensions.
-        Desmin: An intermediate filament in muscle cells, contributing to cytoplasmic staining.
-        Laminin: A component of the basal lamina (part of the ECM), often appears pink in H&E staining.
-        Actin: A cytoskeletal protein found throughout the cytoplasm.
-        CD68: a macrophage marker typically seen as cytoplasmic and eosinophilic
-        Keratin: General keratins are cytoplasmic structural proteins in keratinized tissues like skin and hair, supporting cell structure.
-
-        Markers typically staining epithelial cells and other specific structures (Purple Eosin):
-        cytokeratin and Pan-Cytokeratin (panCK, CK7, CK20): Cytokeratins are intermediate filament proteins in epithelial cells, and their dense networks can give a purple hue.
-        Caveolin-1 (CAV1): Involved in caveolae formation in the cell membrane, often in epithelial and endothelial cells.
-        Aquaporin-1 (AQP1): A water channel protein found in various epithelial and endothelial cells.
-        EpCAM (EPCAM): An epithelial cell adhesion molecule, important in epithelial cell-cell adhesion.
-        E-cadherin, P-cadherin: Adhesion molecules in epithelial cells, contributing to cell-cell junctions, often seen in purple.
-        Mucin 1 (MUC1): A glycoprotein expressed on the surface of epithelial cells, contributing to the viscous secretions.
-        S100: A protein often used to mark nerve cells, melanocytes, and others, contributing to more specific staining often appearing purple.
-        Lyve1: Lymphatic endothelial marker often found near epithelial structures.
-
-        Markers specific to red blood cells:
-        Ter119: A marker specific to erythroid cells (red blood cells).
-        CD235a (Glycophorin A): Another marker specific to erythrocytes.
-        
-        Excluded markers:
-        CD markers that do not appear in H&E: CD3, CD4, CD8, CD19, CD20, CD45, CD68, CD56, CD57, CD163, CD11c, CD38.
-        cytokine receptors: PD-L1, IL18Ra, ICOS, CD40, CD25, CD62L, CD44, CD279 (PD-1).
-        proliferation markers: Ki67, pH3 (phosphorylated Histone H3).
-        Apoptosis and Stress Markers: Cleaved Caspase-3 (Casp3), BCL2, ASNS, ARG1, GLUT1.
-        Phosphorylated Proteins: pS6, p53, pERK, pSTAT3.
-        Oncoproteins and Tumor Markers:  c-Myc, EGFR, c-erbB, HER2, GATA3, Sox9.
-        Isotopic Controls and Non-Biological Labels: Ruthenium and xenon isotopes.
-        Mitochondrial and Organelle-Specific Markers: TOM20, ATP5A, VDAC1 (Voltage-Dependent Anion Channel)
-
-        ''' + \
-        "Give a list of the channels as json file with \"blue\", \"pink\", \"purple\" and \"red\" as classes." + \
-        "Double check your response to make sure it makes sense. Make sure the channels you give are also in the provided list above. A channel can not be in more than one group. If you add cells for blood they must be specific for red blood cells and not just a nuclear stain that also stains red blood cells. Markers that bind directly to DNA or nucleic acid structures and thus stain all nuclei should be included in the blue category. Markers for phosphorylated proteins or signaling molecules should not be included, as they stain only cells where these specific proteins are expressed or active. When you make a list of channels you can only use channel names that are provided above. Forinstance, you can not just make up a name like CD31_77877Nd146Di."
-    
-    
-    
-    
-    if use_chatgpt:
-        from openai import OpenAI
-        print("Using ChatGPT")
-        client = OpenAI(api_key=api_key)
-        
-        completion = client.chat.completions.create(
-            # model="gpt-4-turbo",
-            model="gpt-4o",
-            # model="gpt-4o-mini",
-            messages=[
-            {"role": "system", "content": "You are an expert in digital pathology, imaging mass cytometry, multiplexed imaging and spatial omics."},
-            {"role": "user", "content": content}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
+    # Build a background color array.
+    background_key = "background" if "background" in config else "Background"
+    background_color = (
+        np.array(
+            [
+                config[background_key]["color"]["R"],
+                config[background_key]["color"]["G"],
+                config[background_key]["color"]["B"],
+            ]
         )
+        / 255.0
+    )
 
-        # print(completion.choices[0].message.content)
+    # Create working arrays.
+    white_image = np.full(
+        (imc_image.shape[0], imc_image.shape[2], imc_image.shape[3], 3),
+        background_color,
+        dtype=np.float32,
+    )
+    base_image = np.full(
+        (imc_image.shape[0], imc_image.shape[2], imc_image.shape[3], 3),
+        background_color,
+        dtype=np.float32,
+    )
+    transmission = np.full(
+        (imc_image.shape[0], imc_image.shape[2], imc_image.shape[3], 3),
+        background_color,
+        dtype=np.float32,
+    )
 
-        json_string = completion.choices[0].message.content
+    # Process each configuration entry.
+    for key, value in config["components"].items():
+        if not isinstance(value, dict):
+            continue
+        if "targets" not in value:
+            continue
+        if key.lower() == "background":
+            continue
 
-        # Parse JSON string to dictionary
-        data = json.loads(json_string)
+        # Get channels matching the config targets.
+        channel_list = find_channels(channel_names, value["targets"])
+        if not channel_list:
+            continue
 
-        # Extract lists for blue, pink, and purple
-        blue_list = data['blue']
-        pink_list = data['pink']
-        purple_list = data['purple']
-        red_list = data['red']
-    elif use_gemini:
-        print("Using Gemini")
-        import google.generativeai as genai
+        print(channel_list)
 
-        genai.configure(api_key=api_key)
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                print(m.name)
+        # Normalize channels (vectorized if normalization_values is provided).
+        if normalization_values:
+            indices = [channel_names.index(ch) for ch in channel_list]
+            chan_data = imc_image[
+                :, indices, :, :
+            ]  # shape: (n, num_channels, height, width)
+            scales = np.array(
+                [normalization_values[ch]["scale"] for ch in channel_list]
+            ).reshape(1, -1, 1, 1)
+            offsets = np.array(
+                [normalization_values[ch]["offset"] for ch in channel_list]
+            ).reshape(1, -1, 1, 1)
+            scaled_images = np.clip(chan_data * scales + offsets, 0, 1)
+            image = np.mean(scaled_images, axis=1)
+            # Free temporary variables.
+            del chan_data, scales, offsets, scaled_images
+            maybe_cleanup()
+        else:
+            images = []
+            val1 = value["normalize_percentage_min"]
+            val2 = value["normalize_percentage_max"]
+            print(f"normalize_percentage_min {val1}, normalize_percentage_max {val2}")
+            for ch in channel_list:
+                idx = channel_names.index(ch)
+                norm_image = normalize(
+                    imc_image[:, idx, :, :],
+                    value["normalize_percentage_min"],
+                    value["normalize_percentage_max"],
+                )
+                norm_image = np.clip(norm_image, 0, 1)
+                images.append(norm_image)
+            image = np.mean(images, axis=0)
+            del images
+            maybe_cleanup()
 
-        model = genai.GenerativeModel('gemini-1.5-pro-latest')
-        
-        response = model.generate_content(content)
-        # print(response.text)
-        
-        # Check if the response contains valid text
-        if response and response.text:
-            try:
-                # Remove markdown tags such as ```json
-                cleaned_json_string = re.sub(r"```(?:json)?", "", response.text).strip()
+        # Apply median filter if needed.
+        if value["median_filter_size"] > 0:
+            temp = [
+                median(image[i, ...], disk(value["median_filter_size"]))
+                for i in range(image.shape[0])
+            ]
+            image = np.stack(temp, axis=0)
+            del temp
+            maybe_cleanup()
 
-                # Now you can safely parse the cleaned JSON string
-                data = json.loads(cleaned_json_string)
+        # Apply gaussian filter if needed.
+        if value["gaussian_filter_sigma"] > 0:
+            temp = [
+                gaussian(image[i, ...], sigma=value["gaussian_filter_sigma"])
+                for i in range(image.shape[0])
+            ]
+            image = np.stack(temp, axis=0)
+            del temp
+            maybe_cleanup()
 
-                # Extract lists for blue, pink, purple, and red
-                blue_list = data['blue']
-                pink_list = data['pink']
-                purple_list = data['purple']
-                red_list = data['red']
-            except json.JSONDecodeError as e:
-                print(f"JSONDecodeError: {e}")
-    elif use_claude:
-        print("Using Claude")
-        import anthropic
+        if (
+            value.get("sharpen_filter_amount") is not None
+            and value["sharpen_filter_amount"] > 0
+        ):
+            temp = [
+                unsharp_mask(
+                    image[i, ...],
+                    radius=value["sharpen_filter_radius"],
+                    amount=value["sharpen_filter_amount"],
+                )
+                for i in range(image.shape[0])
+            ]
+            image = np.stack(temp, axis=0)
+            del temp
+            maybe_cleanup()
 
-        client = anthropic.Anthropic(api_key=api_key)
+        # Apply histogram equalization if enabled.
+        if value["histogram_normalisation"]:
+            kernel_size = (50, 50)
+            clip_limit = 0.02
+            nbins = 256
+            temp = [
+                exposure.equalize_adapthist(
+                    image[i, ...],
+                    kernel_size=kernel_size,
+                    clip_limit=clip_limit,
+                    nbins=nbins,
+                )
+                for i in range(image.shape[0])
+            ]
+            image = np.stack(temp, axis=0)
+            del temp
+            maybe_cleanup()
 
-        response = client.completions.create(
-            model="claude-1.3",
-            prompt=f"{anthropic.HUMAN_PROMPT} {content} {anthropic.AI_PROMPT}",
-            max_tokens_to_sample=512,
-            temperature=0,
+        if value.get("clip") is not None:
+            # val1 = value["clip"][0]
+            # val2 = value["clip"][1]
+            # print(f"Clipping to {val1} - {val2}")
+            image = np.clip(image, value["clip"][0], value["clip"][1])
+            image = normalize(image, 0, 100)
+
+        # Adjust intensity.
+        image *= value["intensity"]
+
+        # Calculate exponential attenuation.
+        color = (
+            np.array([value["color"]["R"], value["color"]["G"], value["color"]["B"]])
+            / 255.0
         )
-        
-        print(response)
-
-        # Check if the response contains valid text
-        if response and response.completion:
-            try:
-                # Remove markdown tags such as ```json
-                cleaned_json_string = re.sub(r"```(?:json)?", "", response.completion).strip()
-
-                # Now you can safely parse the cleaned JSON string
-                data = json.loads(cleaned_json_string)
-
-                # Extract lists for blue, pink, purple, and red
-                blue_list = data['blue']
-                pink_list = data['pink']
-                purple_list = data['purple']
-                red_list = data['red']
-            except json.JSONDecodeError as e:
-                print(f"JSONDecodeError: {e}")
-    else:
-        blue_list = find_channels(channel_names, haematoxylin_list )
-        pink_list = find_channels(channel_names, pink_eosin_list )
-        purple_list = find_channels(channel_names, purple_eosin_list )
-        red_list = find_channels(channel_names, blood_list )
-
-    brown_list = find_channels(channel_names, marker_list )
-
-    # Print lists to verify
-    print("Blue channels:", blue_list)
-    print("Pink channels:", pink_list)
-    print("Purple channels:", purple_list)
-    print("Red channels:", red_list)
-    print("Brown channels:", brown_list)
-    
-    print()
-    
-    
-    # Colors for nuclei, cytoplasm and marker
-    if (show_eosin1 or show_eosin2) and (pink_list or purple_list):
-        # Dark purple
-        nuclei_color = np.array([72, 61, 139]) / 255.0  # Converted to 0-1 range
-    else:
-        # Blue
-        nuclei_color = np.array([46, 77, 160]) / 255.0  # Converted to 0-1 range
-    np.array([0, 77, 160]) / 255.0
-    # Pink
-    cytoplasm_color1 = np.array([255, 182, 193]) / 255.0  # Converted to 0-1 range
-
-    # Purple
-    cytoplasm_color2 = np.array([199, 143, 187]) / 255.0  # Converted to 0-1 range
-    bloodcells_color = np.array([186, 56, 69]) / 255.0  # Converted to 0-1 range
-    marker_color = np.array([180, 100, 0]) / 255.0  # Converted to 0-1 range
-    
-
-
-    if blue_list:
-        hematoxylin_image = np.maximum.reduce([
-            normalize(imc_image[:, channel_names.index(ch), :, :], 1, 99) for ch in blue_list
-        ])
-
-        if blue_median_filter_size > 0:
-            # hematoxylin_image = median(hematoxylin_image[i, ...], disk(blue_median_filter_size))
-            hematoxylin_image = np.stack(
-                [median(hematoxylin_image[i, ...], disk(blue_median_filter_size)) for i in range(hematoxylin_image.shape[0])],
-                axis=0
-            )
-
-        if blue_gaussian_filter_sigma > 0:
-            # hematoxylin_image = gaussian(hematoxylin_image, sigma=blue_gaussian_filter_sigma)
-            hematoxylin_image = np.stack(
-                [gaussian(hematoxylin_image[i, ...], sigma=blue_gaussian_filter_sigma) for i in range(hematoxylin_image.shape[0])],
-                axis=0
-            )
-
-        # hematoxylin_image = normalize(hematoxylin_image, 1,99)
-        # hematoxylin_image = np.clip(hematoxylin_image, 0, 1)
-
-        hematoxylin_image = np.stack(
-            [np.clip(normalize(hematoxylin_image[i, ...], 1, 99), 0, 1) for i in range(hematoxylin_image.shape[0])],
-            axis=0
+        absorption = background_color - color
+        transmission *= np.exp(
+            -absorption[np.newaxis, np.newaxis, np.newaxis, :] * image[..., np.newaxis]
         )
+        # Delete image after using it.
+        del image
+        maybe_cleanup()
 
-        if use_haematoxylin_histogram_normalisation:
-            kernel_size = (50, 50)  # you can also try different sizes or None
-            clip_limit = 0.02       # adjust this to control contrast enhancement
-            nbins = 256             # typically 256, but can be adjusted
-            # Apply adaptive histogram equalization with parameters
-            # hematoxylin_image = exposure.equalize_adapthist(hematoxylin_image, kernel_size=kernel_size, clip_limit=clip_limit, nbins=nbins)
-            hematoxylin_image = np.stack(
-                [
-                    exposure.equalize_adapthist(
-                        hematoxylin_image[i, ...], 
-                        kernel_size=kernel_size, 
-                        clip_limit=clip_limit, 
-                        nbins=nbins
-                    ) for i in range(hematoxylin_image.shape[0])
-                ],
-                axis=0
-            )
+    # Apply the computed transmission to base_image.
+    def apply_exponential(i):
+        base_image[..., i] = transmission[..., i]
 
-    if pink_list:
-        eosin_image1 = np.maximum.reduce([
-            normalize(imc_image[:, channel_names.index(ch), :, :], 1, 99) for ch in pink_list
-        ])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        list(executor.map(apply_exponential, range(3)))
+    maybe_cleanup()
 
-        if pink_median_filter_size > 0:
-            # eosin_image1 = median(eosin_image1, disk(pink_median_filter_size))
-            eosin_image1 = np.stack(
-                [median(eosin_image1[i, ...], disk(pink_median_filter_size)) for i in range(eosin_image1.shape[0])],
-                axis=0
-            )
-        if pink_gaussian_filter_sigma > 0:
-            # eosin_image1 = gaussian(eosin_image1, sigma=pink_gaussian_filter_sigma)
-            eosin_image1 = np.stack(
-                [gaussian(eosin_image1[i, ...], sigma=pink_gaussian_filter_sigma) for i in range(eosin_image1.shape[0])],
-                axis=0
-            )
-
-        # eosin_image1 = normalize(eosin_image1, 1,99)
-        # eosin_image1 = np.clip(eosin_image1, 0, 1)
-        eosin_image1 = np.stack(
-            [np.clip(normalize(eosin_image1[i, ...], 1, 99), 0, 1) for i in range(eosin_image1.shape[0])],
-            axis=0
-        )
-
-        if use_eosin_histogram_normalisation:
-            kernel_size = (50, 50)  # you can also try different sizes or None
-            clip_limit = 0.02       # adjust this to control contrast enhancement
-            nbins = 256             # typically 256, but can be adjusted
-            # Apply adaptive histogram equalization with parameters
-            # eosin_image1 = exposure.equalize_adapthist(eosin_image1, kernel_size=kernel_size, clip_limit=clip_limit, nbins=nbins)
-            eosin_image1 = np.stack(
-                [
-                    exposure.equalize_adapthist(
-                        eosin_image1[i, ...], 
-                        kernel_size=kernel_size, 
-                        clip_limit=clip_limit, 
-                        nbins=nbins
-                    ) for i in range(eosin_image1.shape[0])
-                ],
-                axis=0
-            )
-
-    if purple_list:
-        eosin_image2 = np.maximum.reduce([
-            normalize(imc_image[:, channel_names.index(ch), :, :], 1, 99) for ch in purple_list
-        ])
-
-        if purple_median_filter_size > 0:
-            # eosin_image2 = median(eosin_image2, disk(purple_median_filter_size))
-            eosin_image2 = np.stack(
-                [median(eosin_image2[i, ...], disk(purple_median_filter_size)) for i in range(eosin_image2.shape[0])],
-                axis=0
-            )
-        if purple_gaussian_filter_sigma > 0:
-            # eosin_image2 = gaussian(eosin_image2, sigma=purple_gaussian_filter_sigma)
-            eosin_image2 = np.stack(
-                [gaussian(eosin_image2[i, ...], sigma=purple_gaussian_filter_sigma) for i in range(eosin_image2.shape[0])],
-                axis=0
-            )
-
-        # eosin_image2 = normalize(eosin_image2, 1,99)
-        # eosin_image2 = np.clip(eosin_image2, 0, 1)
-        eosin_image2 = np.stack(
-            [np.clip(normalize(eosin_image2[i, ...], 1, 99), 0, 1) for i in range(eosin_image2.shape[0])],
-            axis=0
-        )
-
-        if use_eosin_histogram_normalisation:
-            kernel_size = (50, 50)  # you can also try different sizes or None
-            clip_limit = 0.02       # adjust this to control contrast enhancement
-            nbins = 256             # typically 256, but can be adjusted
-            # Apply adaptive histogram equalization with parameters
-            # eosin_image2 = exposure.equalize_adapthist(eosin_image2, kernel_size=kernel_size, clip_limit=clip_limit, nbins=nbins)
-            eosin_image2 = np.stack(
-                [
-                    exposure.equalize_adapthist(
-                        eosin_image2[i, ...], 
-                        kernel_size=kernel_size, 
-                        clip_limit=clip_limit, 
-                        nbins=nbins
-                    ) for i in range(eosin_image2.shape[0])
-                ],
-                axis=0
-            )
-
-    if red_list:
-        bloodcells_image1 = np.maximum.reduce([
-            normalize(imc_image[:, channel_names.index(ch), :, :], 1, 99) for ch in red_list
-        ])
-        # bloodcells_image1 = median(bloodcells_image1, disk(2))
-        # bloodcells_image1 = uniform_filter(bloodcells_image1, size=3)
-        # Function to create a normalized disk-shaped kernel
-        # def create_circular_mean_kernel(radius):
-        #     kernel = disk(radius)
-        #     return kernel / kernel.sum()
-        # circular_kernel = create_circular_mean_kernel(radius=1)
-        # bloodcells_image1 = convolve(bloodcells_image1, circular_kernel)
-
-        if red_median_filter_size > 0:
-            # bloodcells_image1 = median(bloodcells_image1, disk(red_median_filter_size))
-            bloodcells_image1 = np.stack(
-                [median(bloodcells_image1[i, ...], disk(red_median_filter_size)) for i in range(bloodcells_image1.shape[0])],
-                axis=0
-            )
-        if red_gaussian_filter_sigma > 0:
-            # bloodcells_image1 = gaussian(bloodcells_image1, sigma=red_gaussian_filter_sigma)
-            bloodcells_image1 = np.stack(
-                [gaussian(bloodcells_image1[i, ...], sigma=red_gaussian_filter_sigma) for i in range(bloodcells_image1.shape[0])],
-                axis=0
-            )
-
-        # bloodcells_image1 = normalize(bloodcells_image1, 1,99)
-        # bloodcells_image1 = np.clip(bloodcells_image1, 0, 1)
-        bloodcells_image1 = np.stack(
-            [np.clip(normalize(bloodcells_image1[i, ...], 1, 99), 0, 1) for i in range(bloodcells_image1.shape[0])],
-            axis=0
-        )
-
-    if brown_list:
-        marker_image1 = np.maximum.reduce([
-            normalize(imc_image[:, channel_names.index(ch), :, :], 1, 99) for ch in brown_list
-        ])
-
-        if brown_median_filter_size > 0:
-            # marker_image1 = median(marker_image1, disk(brown_median_filter_size))
-            marker_image1 = np.stack(
-                [median(marker_image1[i, ...], disk(brown_median_filter_size)) for i in range(marker_image1.shape[0])],
-                axis=0
-            )
-        if brown_gaussian_filter_sigma > 0:
-            # marker_image1 = gaussian(marker_image1, sigma=brown_gaussian_filter_sigma)
-            marker_image1 = np.stack(
-                [gaussian(marker_image1[i, ...], sigma=brown_gaussian_filter_sigma) for i in range(marker_image1.shape[0])],
-                axis=0
-            )
-
-        # marker_image1 = normalize(marker_image1, 1,99)
-        # marker_image1 = np.clip(marker_image1, 0, 1)
-        marker_image1 = np.stack(
-            [np.clip(normalize(marker_image1[i, ...], 1, 99), 0, 1) for i in range(marker_image1.shape[0])],
-            axis=0
-        )
-
-
-    # Create RGB images for each component
-    white_image = np.ones(hematoxylin_image.shape + (3,), dtype=np.float32)  # White background
-    base_image = np.ones(hematoxylin_image.shape + (3,), dtype=np.float32)  # White background
-
-    # Apply the color based on the intensity
-    if show_eosin1:
-        if pink_list:
-            for i in range(3):
-                base_image[..., i] -= (white_image[..., i] - cytoplasm_color1[i]) * eosin_image1
-
-    if show_eosin2:
-        if purple_list:
-            for i in range(3):
-                base_image[..., i] -= (white_image[..., i] - cytoplasm_color2[i]) * eosin_image2
-
-    if show_haematoxylin and blue_list:
-        for i in range(3):
-            base_image[..., i] -= (white_image[..., i] - nuclei_color[i]) * hematoxylin_image
-
-    if show_marker and brown_list:
-        for i in range(3):
-            base_image[..., i] -= (white_image[..., i] - marker_color[i]) * marker_image1
-
-    if show_blood and red_list:
-        for i in range(3):
-            base_image[..., i] -= (white_image[..., i] - bloodcells_color[i]) * bloodcells_image1
-
-
-    # Ensure the pixel values remain within the valid range
+    # Clip and convert to uint8.
     base_image = np.clip(base_image, 0, 1)
     base_image_uint8 = (base_image * 255).astype(np.uint8)
-    
-    
-    if output_pixel_size_x != input_pixel_size_x or output_pixel_size_y != input_pixel_size_y:
-        print("Resampling")
+    # Free unneeded arrays.
+    del base_image, transmission
+    maybe_cleanup()
+
+    # Resample if needed.
+    if (
+        output_pixel_size_x != input_pixel_size_x
+        or output_pixel_size_y != input_pixel_size_y
+    ):
+        # print("Resampling")
+
         if AI_enhancement:
             interpolation = sitk.sitkNearestNeighbor
         else:
             interpolation = sitk.sitkLinear
-        base_image_uint8 = resample_rgb_slices(base_image_uint8, input_pixel_size_x, input_pixel_size_y, output_pixel_size_x, output_pixel_size_y, interpolation=interpolation)
 
-    
+        base_image_uint8 = resample_rgb_slices(
+            base_image_uint8,
+            input_pixel_size_x,
+            input_pixel_size_y,
+            output_pixel_size_x,
+            output_pixel_size_y,
+            interpolation=interpolation,
+        )
+        maybe_cleanup()
+
+    # Apply AI enhancement if requested.
     if AI_enhancement:
         print("Enhancing image")
         base_image_uint8 = np.squeeze(base_image_uint8, axis=0)
-        base_image_uint8 = EnhanceBrightfield(base_image_uint8)  
+        base_image_uint8 = EnhanceBrightfield(base_image_uint8)
         base_image_uint8 = np.expand_dims(base_image_uint8, axis=0)
-    
-    if reference_filename:
-        print("Appling histogram matching")
-        reference_image = io.imread(reference_filename)
-        base_image_uint8 = np.squeeze(base_image_uint8, axis=0)
-        base_image_uint8 = exposure.match_histograms(base_image_uint8, reference_image, channel_axis=-1)
-        base_image_uint8 = np.expand_dims(base_image_uint8, axis=0)
+        maybe_cleanup()
 
+    # Apply histogram matching if a reference is provided.
+    # if reference_filename:
+    #     print("Applying histogram matching")
+    #     reference_image = io.imread(reference_filename)
+    #     matched_images = []
+    #     for i in range(base_image_uint8.shape[0]):
+    #         matched_image = exposure.match_histograms(
+    #             base_image_uint8[i], reference_image, channel_axis=-1
+    #         )
+    #         matched_images.append(matched_image)
+    #     base_image_uint8 = np.array(matched_images)
+    #     del matched_images, reference_image
+    #     maybe_cleanup()
 
+    # Final transposition.
     base_image_uint8_transpose = np.transpose(base_image_uint8, (0, 3, 1, 2))
+    del base_image_uint8
+    maybe_cleanup()
 
-    # Write the OME-TIFF file
-    write_ome_tiff(data=base_image_uint8_transpose,
-                   output_filename=output_filename,
-                   pixel_size_x=output_pixel_size_x,
-                   pixel_size_y=output_pixel_size_y,
-                   physical_size_z=output_physical_size_z,
-                   Unit='µm',
-                   imagej=False, 
-                   create_pyramid=True,
-                   compression='zlib')
+    # Write the output file if requested.
+    if output_filename:
+        if output_filename.lower().endswith(("ome.tif", "ome.tiff")):
+            write_ome_tiff(
+                data=base_image_uint8_transpose,
+                output_filename=output_filename,
+                pixel_size_x=output_pixel_size_x,
+                pixel_size_y=output_pixel_size_y,
+                physical_size_z=output_physical_size_z,
+                Unit="µm",
+                imagej=False,
+                create_pyramid=True,
+                compression="zlib",
+                downsample_count=downsample_count,
+            )
+            print("The OME-TIFF file has been successfully written.")
+        else:
+            # For non-OME, perform an extra transposition.
+            base_image_uint8_transpose = np.transpose(
+                base_image_uint8_transpose, (0, 3, 2, 1)
+            ).astype(np.uint8)
+            sitk_image = sitk.GetImageFromArray(
+                base_image_uint8_transpose, isVector=True
+            )
+            image_size = sitk_image.GetSize()
+            print(f"Image size: {image_size}")
+            sitk_image.SetSpacing(
+                [output_pixel_size_x, output_pixel_size_y, output_physical_size_z]
+            )
+            sitk_image.SetOrigin([0.0, 0.0, 0.0])
+            sitk.WriteImage(sitk_image, output_filename)
+            print("The file has been successfully written.")
+            del sitk_image
+            maybe_cleanup()
 
-    print("The OME-TIFF file has been successfully written.")
+    # Delete remaining large arrays.
+    del imc_image, white_image
+    maybe_cleanup()
+
+    return base_image_uint8_transpose
+
+
+def process_single_tile(
+    tx,
+    ty,
+    tile_size,
+    height,
+    width,
+    filename,
+    n_channels,
+    channel_names,
+    config,
+    norm_values,
+    pixel_sizes,
+    output_pixel_size_x,
+    output_pixel_size_y,
+    multi_page,
+):
+    """
+    Process a single tile from a multiplex image.
+
+    This function computes the corresponding input region for an output tile based on scaling factors, 
+    reads the relevant data from the TIFF file, and processes the tile to produce a virtual brightfield 
+    image segment. If necessary, the resulting tile is cropped or padded to match the target dimensions.
+
+    Args:
+        tx (int): The x-index of the tile within the output grid.
+        ty (int): The y-index of the tile within the output grid.
+        tile_size (int): The pixel size of each output tile.
+        height (int): The height of the input image.
+        width (int): The width of the input image.
+        filename (str): Path to the input TIFF file.
+        n_channels (int): Number of channels in the input image.
+        channel_names (list of str): List of channel names from the input image.
+        config (dict): Configuration dictionary for stain simulation.
+        norm_values (dict): Normalization values computed from a center crop of the image.
+        pixel_sizes (dict): Dictionary containing pixel sizes (e.g., {"x": float, "y": float, "z": float}).
+        output_pixel_size_x (float): Desired output pixel size in the X direction.
+        output_pixel_size_y (float): Desired output pixel size in the Y direction.
+        multi_page (bool): Whether the TIFF file contains multiple pages representing separate channels.
+
+    Returns:
+        numpy.ndarray: The processed tile data as an array with shape (3, tile_height, tile_width).
+    """
+    
+    scale_x = pixel_sizes["x"] / output_pixel_size_x
+    scale_y = pixel_sizes["y"] / output_pixel_size_y
+
+    y_start_out = ty * tile_size
+    x_start_out = tx * tile_size
+
+    scaled_height = int(round(height * scale_y))
+    scaled_width = int(round(width * scale_x))
+    y_end_out = min((ty + 1) * tile_size, scaled_height)
+    x_end_out = min((tx + 1) * tile_size, scaled_width)
+    target_height = y_end_out - y_start_out
+    target_width = x_end_out - x_start_out
+
+    input_y_start = int(math.floor(y_start_out / scale_y))
+    input_x_start = int(math.floor(x_start_out / scale_x))
+    input_y_end = int(math.ceil(min(y_end_out, scaled_height) / scale_y))
+    input_x_end = int(math.ceil(min(x_end_out, scaled_width) / scale_x))
+
+    if input_y_end <= input_y_start or input_x_end <= input_x_start:
+        return np.zeros((3, target_height, target_width), dtype=np.uint8)
+
+    try:
+        channels = []
+        with tifffile.TiffFile(filename) as tif:
+            if multi_page:
+                for i in range(n_channels):
+                    arr = tif.pages[i].asarray()[
+                        input_y_start:input_y_end, input_x_start:input_x_end
+                    ]
+                    if arr.ndim == 3 and arr.shape[2] == 1:
+                        arr = np.squeeze(arr, axis=2)
+                    channels.append(arr)
+            else:
+                arr = tif.pages[0].asarray()[
+                    input_y_start:input_y_end, input_x_start:input_x_end
+                ]
+                if arr.ndim == 3 and arr.shape[2] == 1:
+                    arr = np.squeeze(arr, axis=2)
+                for i in range(n_channels):
+                    channels.append(arr[..., i])
+
+        tile = np.stack(channels, axis=0)
+        tile = np.expand_dims(tile, axis=0)
+
+        processed = convert(
+            tile,
+            output_filename=None,
+            input_pixel_size_x=pixel_sizes["x"],
+            input_pixel_size_y=pixel_sizes["y"],
+            output_pixel_size_x=output_pixel_size_x,
+            output_pixel_size_y=output_pixel_size_y,
+            channel_names=channel_names,
+            config=config,
+            create_pyramid=False,
+            normalization_values=norm_values,
+            AI_enhancement=False,
+        )
+        result = processed[0].copy()  # shape (3, tile_h, tile_w)
+
+        res_h, res_w = result.shape[1], result.shape[2]
+        if res_h != target_height or res_w != target_width:
+            if res_h > target_height:
+                result = result[:, :target_height, :]
+            elif res_h < target_height:
+                pad_h = target_height - res_h
+                result = np.pad(result, ((0, 0), (0, pad_h), (0, 0)), mode="constant")
+            if res_w > target_width:
+                result = result[:, :, :target_width]
+            elif res_w < target_width:
+                pad_w = target_width - res_w
+                result = np.pad(result, ((0, 0), (0, 0), (0, pad_w)), mode="constant")
+
+        del processed, tile, channels
+        maybe_cleanup()
+        return result
+
+    except Exception as e:
+        print(f"Error processing tile at ({tx}, {ty}): {e}")
+        raise
