@@ -20,10 +20,11 @@ def maybe_cleanup(threshold_percent=90):
     Returns:
         None
     """
-    memory_info = psutil.virtual_memory()  # memory usage info
-    if memory_info.percent >= threshold_percent:
-        print(f"Memory usage is {memory_info.percent}% — calling gc.collect()")
-        gc.collect()
+    # memory_info = psutil.virtual_memory()  # memory usage info
+    # if memory_info.percent >= threshold_percent:
+    #     print(f"Memory usage is {memory_info.percent}% — calling gc.collect()")
+    #     gc.collect()
+    gc.collect()
 
 
 def format_time_remaining(seconds):
@@ -138,31 +139,35 @@ def find_channels(channel_names, marker_channels):
     return matches
 
 
-def get_normalization_values(
-    image, channel_names, percentile_min=10, percentile_max=90
-):
-    """
-    Calculate normalization factors (scale and offset) for each image channel.
 
-    For each channel in the provided list, this function computes the given percentiles from the 
-    image data and calculates a scale and offset to normalize pixel intensities linearly.
 
-    Args:
-        image (numpy.ndarray): Multiplex image array with shape (n_slices, n_channels, height, width).
-        channel_names (list of str): List of channel names corresponding to the channels in the image.
-        percentile_min (int, optional): Lower percentile for normalization. Defaults to 10.
-        percentile_max (int, optional): Upper percentile for normalization. Defaults to 90.
 
-    Returns:
-        dict: A dictionary mapping each channel name to a dictionary with 'scale' and 'offset' values.
-    """
-    norm_values = {}
-    print(f"Normalizing to {percentile_min} - {percentile_max}")
-    for idx, channel in enumerate(channel_names):
-        chan_data = image[:, idx, :, :]
-        p_min = np.percentile(chan_data, percentile_min)
-        p_max = np.percentile(chan_data, percentile_max)
-        scale = 1.0 / (p_max - p_min)
-        offset = -p_min * scale
-        norm_values[channel] = {"scale": scale, "offset": offset}
-    return norm_values
+# def get_normalization_values(
+#     image, channel_names, percentile_min=10, percentile_max=90
+# ):
+#     """
+#     Calculate normalization factors (scale and offset) for each image channel.
+
+#     For each channel in the provided list, this function computes the given percentiles from the 
+#     image data and calculates a scale and offset to normalize pixel intensities linearly.
+
+#     Args:
+#         image (numpy.ndarray): Multiplex image array with shape (n_slices, n_channels, height, width).
+#         channel_names (list of str): List of channel names corresponding to the channels in the image.
+#         percentile_min (int, optional): Lower percentile for normalization. Defaults to 10.
+#         percentile_max (int, optional): Upper percentile for normalization. Defaults to 90.
+
+#     Returns:
+#         dict: A dictionary mapping each channel name to a dictionary with 'scale' and 'offset' values.
+#     """
+#     norm_values = {}
+#     print(f"Calculating normalization values with {percentile_min}% - {percentile_max}%")
+#     for idx, channel in enumerate(channel_names):
+#         chan_data = image[:, idx, :, :]
+#         p_min = np.percentile(chan_data, percentile_min)
+#         p_max = np.percentile(chan_data, percentile_max)
+#         scale = 1.0 / (p_max - p_min)
+#         offset = -p_min * scale
+#         norm_values[channel] = {"scale": scale, "offset": offset}
+#     print(f"Normalization completed")
+#     return norm_values

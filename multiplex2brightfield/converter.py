@@ -14,26 +14,53 @@ from skimage import exposure, io  # Used for histogram equalization, io.imread
 import SimpleITK as sitk  # Used for sitk.GetImageFromArray, etc.
 from lxml import etree  # Used for etree.fromstring(ome_metadata.encode('utf-8'))
 
-import configuration_presets  # For configuration_presets.GetConfiguration
+# import configuration_presets
+try:
+    from . import configuration_presets
+except ImportError:
+    import configuration_presets
+    
 from numpy2ometiff import write_ome_tiff
 
+dtype_working = np.float16
+
 # Local modules
-from utils import (
+try:
+    from .utils import (
     maybe_cleanup,
     format_time_remaining,
     resample_rgb_slices,
     find_channels,
-    get_normalization_values,
+    #get_normalization_values,
 )
-from enhancement import EnhanceBrightfield
-from tiff_utils import (
+except ImportError:
+    from utils import (
+    maybe_cleanup,
+    format_time_remaining,
+    resample_rgb_slices,
+    find_channels,
+    #get_normalization_values,
+)
+
+try:
+    from .tiff_utils import (
     get_image_metadata,
     get_normalisation_values_from_center_crop,
     add_pyramids_efficient_memmap,
     add_pyramids_inmemory,
 )
-from llm_utils import query_llm_for_channels
+except ImportError:
+    from tiff_utils import (
+    get_image_metadata,
+    get_normalisation_values_from_center_crop,
+    add_pyramids_efficient_memmap,
+    add_pyramids_inmemory,
+)
 
+try:
+    from .llm_utils import query_llm_for_channels
+except ImportError:
+    from llm_utils import query_llm_for_channels
 
 def convert_from_file(
     input_filename,
@@ -66,11 +93,10 @@ def convert_from_file(
     sharpen_filter_amount=0,
     histogram_normalisation=False,
     clip=None,
-    normalize_percentage_min=10,
-    normalize_percentage_max=90,
     process_tiled=False,
     tile_size=8192,
     use_memmap=False,
+    use_subtractive_method=False,
 ):
     """
     Convert a multiplex image from an OME-TIFF file to a virtual brightfield image.
@@ -112,8 +138,6 @@ def convert_from_file(
         sharpen_filter_amount (float): Amount of sharpening to apply.
         histogram_normalisation (bool): If True, perform histogram normalization on channels.
         clip (tuple or None): Value range for clipping channel intensities.
-        normalize_percentage_min (int): Lower percentile for intensity normalization.
-        normalize_percentage_max (int): Upper percentile for intensity normalization.
         process_tiled (bool): If True, process the image in smaller tiles.
         tile_size (int): Size (in pixels) for each tile when processing tiled.
         use_memmap (bool): If True, employ memory mapping for handling large images.
@@ -127,55 +151,59 @@ def convert_from_file(
         input_pixel_size_y = 1
     if input_physical_size_z is None:
         input_physical_size_z = 1
-
+    
     if process_tiled:
-
         with tifffile.TiffFile(input_filename) as tif:
-            shape = tif.pages[0].shape
-            height, width = shape[:2]
-            if len(tif.pages) == 1 and len(shape) >= 3:
-                n_channels = shape[2]
-                multi_page = False
+            shape = tif.series[0].shape
+            if len(shape) == 4:
+                n_z, n_channels, height, width = shape
+            elif len(shape) == 3:
+                n_z = 1
+                n_channels, height, width = shape
             else:
-                n_channels = len(tif.pages)
-                multi_page = True
-            pixel_sizes, channel_names = get_image_metadata(tif, multi_page, n_channels)
+                raise ValueError("Unsupported image shape for tiling.")
+
+            pixel_sizes, channel_names = get_image_metadata(tif, False, n_channels)
 
         print(
-            f"Image dimensions: {width}x{height} pixels, Channels: {n_channels}, Pixel sizes: {pixel_sizes}"
+            f"Image dimensions: {width}x{height} pixels, Z-sections: {n_z}, Channels: {n_channels}, Pixel sizes: {pixel_sizes}"
         )
+        
+        if output_pixel_size_x is None:
+            output_pixel_size_x = pixel_sizes["x"]
+        if output_pixel_size_y is None:
+            output_pixel_size_y = pixel_sizes["y"]
 
         scale_x = pixel_sizes["x"] / output_pixel_size_x
         scale_y = pixel_sizes["y"] / output_pixel_size_y
-        scaled_width = int(round(width * scale_x))
-        scaled_height = int(round(height * scale_y))
-        print(f"Scaling factors: {scale_x:.3f}, {scale_y:.3f}")
-        print(f"Scaled dimensions: {scaled_width}x{scaled_height}")
+        scaled_width  = math.ceil(width  * scale_x)
+        scaled_height = math.ceil(height * scale_y)
 
         n_tiles_x = math.ceil(scaled_width / tile_size)
         n_tiles_y = math.ceil(scaled_height / tile_size)
-        total_tiles = n_tiles_x * n_tiles_y
+        total_tiles = n_z * n_tiles_y * n_tiles_x
 
-        # print("Channel names: ", channel_names)
-
+        # Get normalization values only once (could adapt for Z-dependent normalization if needed)
         norm_values = get_normalisation_values_from_center_crop(input_filename)
 
-        # Conditional allocation of the output array.
+        # Conditional allocation of the output array (use memmap for large data)
         if use_memmap:
-            temp_output_path = "temp_output.dat"
+            print("Generating memmap")
+            temp_output_path = "temp_output_multiz.dat"
             output_array = np.memmap(
                 temp_output_path,
                 dtype=np.uint8,
                 mode="w+",
-                shape=(scaled_height, scaled_width, 3),
+                shape=(n_z, scaled_height, scaled_width, 3),
             )
-            output_array[:] = 0  # Initialize to zero.
+            output_array[:] = 0
         else:
-            output_array = np.zeros((scaled_height, scaled_width, 3), dtype=np.uint8)
+            output_array = np.zeros((n_z, scaled_height, scaled_width, 3), dtype=np.uint8)
 
+        
         processed_tiles = 0
         processing_start_time = time.time()
-
+        
         for ty in range(n_tiles_y):
             for tx in range(n_tiles_x):
                 tile_data = process_single_tile(
@@ -185,6 +213,7 @@ def convert_from_file(
                     height,
                     width,
                     input_filename,
+                    n_z,              # NEW: number of z-slices
                     n_channels,
                     channel_names,
                     config,
@@ -192,21 +221,25 @@ def convert_from_file(
                     pixel_sizes,
                     output_pixel_size_x,
                     output_pixel_size_y,
-                    multi_page,
-                )  # shape: (3, tile_h, tile_w)
-                # Transpose to interleaved (tile_h, tile_w, 3)
-                tile_data = tile_data.transpose(1, 2, 0)
-                y_start = ty * tile_size
-                x_start = tx * tile_size
-                y_end = min((ty + 1) * tile_size, scaled_height)
-                x_end = min((tx + 1) * tile_size, scaled_width)
-                output_array[y_start:y_end, x_start:x_end, :] = tile_data
+                    False,            # multi_page
+                )  # should return shape: (Z, 3, tile_h, tile_w)
+
+                # Write all Z slices into output_array
+                for z in range(n_z):
+                    tile_z = tile_data[z].transpose(1, 2, 0)  # (tile_h, tile_w, 3)
+
+                    y_start = ty * tile_size
+                    x_start = tx * tile_size
+                    
+                    h, w = tile_z.shape[:2]
+                    y_end = y_start + h
+                    x_end = x_start + w
+
+                    output_array[z, y_start:y_end, x_start:x_end, :] = tile_z
 
                 processed_tiles += 1
                 elapsed_time = time.time() - processing_start_time
-                tiles_per_second = (
-                    processed_tiles / elapsed_time if elapsed_time > 0 else 0
-                )
+                tiles_per_second = processed_tiles / elapsed_time if elapsed_time > 0 else 0
                 remaining_tiles = total_tiles - processed_tiles
                 estimated_time_remaining = (
                     remaining_tiles / tiles_per_second if tiles_per_second > 0 else 0
@@ -237,28 +270,31 @@ def convert_from_file(
 
         print("\nWriting pyramid levels...")
         if use_memmap:
-            # Pyramid generation without loading the full image into memory.
             add_pyramids_efficient_memmap(
-                input_memmap_path=temp_output_path,
+                temp_output_path,              # not base_image
                 output_path=output_filename,
-                shape=(scaled_height, scaled_width, 3),
+                shape=output_array.shape,      # <--- add this line
                 num_levels=downsample_count,
                 tile_size=1024,
-                base_metadata=base_metadata,
+                pixel_size_x=output_pixel_size_x,
+                pixel_size_y=output_pixel_size_y,
+                physical_size_z=output_physical_size_z,
+                Unit="µm"
             )
         else:
-            # Load full image into memory and generate pyramid levels.
-            base_image = np.array(output_array)  # already in shape (H, W, 3)
+            base_image = np.array(output_array)
             add_pyramids_inmemory(
                 base_image,
                 output_path=output_filename,
                 num_levels=downsample_count,
                 tile_size=1024,
-                base_metadata=base_metadata,
+                pixel_size_x=output_pixel_size_x,
+                pixel_size_y=output_pixel_size_y,
+                physical_size_z=output_physical_size_z,
+                Unit="µm"
             )
 
         if use_memmap:
-            # Clean up the temporary base image memmap.
             del output_array
             os.remove(temp_output_path)
         maybe_cleanup()
@@ -324,13 +360,13 @@ def convert_from_file(
         print("Number of slices: ", imc_image.shape[0])
         # print("Channel names: ", channel_names)
 
-        if normalization_values is None:
-            normalization_values = get_normalization_values(
-                imc_image,
-                channel_names,
-                percentile_min=normalize_percentage_min,
-                percentile_max=normalize_percentage_max,
-            )
+        # if normalization_values is None:
+        #     normalization_values = get_normalization_values(
+        #         imc_image,
+        #         channel_names,
+        #         percentile_min=all_channel_normalize_percentage_min,
+        #         percentile_max=all_channel_normalize_percentage_max,
+        #     )
 
         return convert(
             imc_image,
@@ -363,8 +399,7 @@ def convert_from_file(
             sharpen_filter_amount=sharpen_filter_amount,
             histogram_normalisation=histogram_normalisation,
             clip=clip,
-            normalize_percentage_min=normalize_percentage_min,
-            normalize_percentage_max=normalize_percentage_max,
+            use_subtractive_method = use_subtractive_method,
         )
 
 
@@ -399,8 +434,7 @@ def convert(
     sharpen_filter_amount=0,
     histogram_normalisation=False,
     clip=None,
-    normalize_percentage_min=10,
-    normalize_percentage_max=90,
+    use_subtractive_method=False,
 ):
     """
     Convert a multiplex image (as an array) to a virtual brightfield image.
@@ -442,16 +476,14 @@ def convert(
         sharpen_filter_amount (float): Amount of sharpening to apply.
         histogram_normalisation (bool): If True, perform histogram normalization.
         clip (tuple or None): Clipping range for intensity values.
-        normalize_percentage_min (int): Lower percentile for normalization.
-        normalize_percentage_max (int): Upper percentile for normalization.
 
     Returns:
         numpy.ndarray: The processed virtual brightfield image data, transposed for OME-TIFF output.
     """
 
-    if reference_filename is None:
-        reference_filename = []
-
+    # if reference_filename is None:
+    #     reference_filename = []
+    
     if config is None and not (use_chatgpt or use_gemini or use_claude):
         config = configuration_presets.GetConfiguration(stain)
 
@@ -470,8 +502,8 @@ def convert(
             sharpen_filter_amount=sharpen_filter_amount,
             histogram_normalisation=histogram_normalisation,
             clip=clip,
-            normalize_percentage_min=normalize_percentage_min,
-            normalize_percentage_max=normalize_percentage_max,
+            all_channel_normalize_percentage_min=all_channel_normalize_percentage_min,
+            all_channel_normalize_percentage_max=all_channel_normalize_percentage_max,
             use_chatgpt=use_chatgpt,
             use_gemini=use_gemini,
             use_claude=use_claude,
@@ -514,21 +546,15 @@ def convert(
     white_image = np.full(
         (imc_image.shape[0], imc_image.shape[2], imc_image.shape[3], 3),
         background_color,
-        dtype=np.float32,
+        dtype=dtype_working,
     )
-    base_image = np.full(
-        (imc_image.shape[0], imc_image.shape[2], imc_image.shape[3], 3),
-        background_color,
-        dtype=np.float32,
-    )
-    transmission = np.full(
-        (imc_image.shape[0], imc_image.shape[2], imc_image.shape[3], 3),
-        background_color,
-        dtype=np.float32,
-    )
+    base_image = np.full_like(white_image, background_color.astype(dtype_working))
+    transmission = np.full_like(white_image, background_color.astype(dtype_working))
 
     # Process each configuration entry.
     for key, value in config["components"].items():
+        # print(f"Processing component {key}")
+        
         if not isinstance(value, dict):
             continue
         if "targets" not in value:
@@ -541,43 +567,94 @@ def convert(
         if not channel_list:
             continue
 
-        print(channel_list)
+        # print(channel_list)
+        # print("Shape imc_image:", imc_image.shape)
 
         # Normalize channels (vectorized if normalization_values is provided).
         if normalization_values:
-            indices = [channel_names.index(ch) for ch in channel_list]
-            chan_data = imc_image[
-                :, indices, :, :
-            ]  # shape: (n, num_channels, height, width)
-            scales = np.array(
-                [normalization_values[ch]["scale"] for ch in channel_list]
-            ).reshape(1, -1, 1, 1)
-            offsets = np.array(
-                [normalization_values[ch]["offset"] for ch in channel_list]
-            ).reshape(1, -1, 1, 1)
-            scaled_images = np.clip(chan_data * scales + offsets, 0, 1)
-            image = np.mean(scaled_images, axis=1)
-            # Free temporary variables.
-            del chan_data, scales, offsets, scaled_images
-            maybe_cleanup()
-        else:
+            z_count = imc_image.shape[0]
             images = []
-            val1 = value["normalize_percentage_min"]
-            val2 = value["normalize_percentage_max"]
-            print(f"normalize_percentage_min {val1}, normalize_percentage_max {val2}")
-            for ch in channel_list:
-                idx = channel_names.index(ch)
-                norm_image = normalize(
-                    imc_image[:, idx, :, :],
-                    value["normalize_percentage_min"],
-                    value["normalize_percentage_max"],
-                )
-                norm_image = np.clip(norm_image, 0, 1)
-                images.append(norm_image)
-            image = np.mean(images, axis=0)
-            del images
-            maybe_cleanup()
 
+            norm_slices = []
+
+            for i in range(z_count):
+                norm_channels = []
+                for ch in channel_list:
+                    idx = channel_names.index(ch)
+                    # norm_channel = normalize(
+                    #     imc_image[i, idx, :, :],  # shape (H, W)
+                    #     val1,
+                    #     val2,
+                    # )
+                    # print(f"Normalization keys for Z={i}: {list(normalization_values[i].keys())}")
+                    # print(f"Channel list used: {channel_list}")
+                    # print(f"Normalization keys for Z={i}: {list(normalization_values[i].keys())}")
+
+                    scale = normalization_values[i][ch]["scale"]
+                    offset = normalization_values[i][ch]["offset"]
+                    
+                    # print(f"i {i} ch {ch} scale {scale} offset {offset}")                    
+
+                    norm_channel = np.clip(imc_image[i, idx, :, :] * scale + offset, 0, 1).astype(np.float16)
+                    
+                    if norm_channel.ndim == 3 and norm_channel.shape[0] == 1:
+                        norm_channel = norm_channel[0]
+
+                    norm_channel = np.clip(norm_channel, 0, 1).astype(np.float16)
+                    norm_channels.append(norm_channel)
+
+                norm_channels = np.array(norm_channels)  # shape: (C, H, W)
+                avg_slice = np.mean(norm_channels, axis=0).astype(np.float16)  # shape: (H, W)
+                norm_slices.append(avg_slice)
+
+            image = np.stack(norm_slices, axis=0)  # shape: (Z, H, W)
+            
+        else:
+            z_count = imc_image.shape[0]
+            images = []
+            normalize_percentage_min = value["normalize_percentage_min"]
+            normalize_percentage_max = value["normalize_percentage_max"]
+            # print(f"normalize_percentage_min {val1}, normalize_percentage_max {val2}")
+            # print(f"channel_list: {channel_list}")
+            
+            norm_slices = []
+
+            for i in range(z_count):
+                norm_channels = []
+                for ch in channel_list:
+                    idx = channel_names.index(ch)
+                    
+                    
+                    val1 = np.percentile(imc_image[i, idx, :, :], normalize_percentage_min)
+                    val2 = np.percentile(imc_image[i, idx, :, :], normalize_percentage_max)
+
+                    scale = 1.0 / (val2 - val1)
+                    offset = -val1 / (val2 - val1)
+                    
+                    # print(f"i {i} ch {ch} scale {scale} offset {offset}")    
+                    
+                    norm_channel = np.clip(imc_image[i, idx, :, :] * scale + offset, 0, 1).astype(np.float16)
+                    # norm_channel = normalize(
+                    #     imc_image[i, idx, :, :],  # shape (H, W)
+                    #     val1,
+                    #     val2,
+                    # )
+                    
+                    if norm_channel.ndim == 3 and norm_channel.shape[0] == 1:
+                        norm_channel = norm_channel[0]
+
+                    norm_channel = np.clip(norm_channel, 0, 1).astype(np.float16)
+                    norm_channels.append(norm_channel)
+
+                norm_channels = np.array(norm_channels)  # shape: (C, H, W)
+                avg_slice = np.mean(norm_channels, axis=0).astype(np.float16)  # shape: (H, W)
+                norm_slices.append(avg_slice)
+
+            image = np.stack(norm_slices, axis=0)
+
+        # Convert to float32 before filtering
+        image = image.astype(np.float32)
+        
         # Apply median filter if needed.
         if value["median_filter_size"] > 0:
             temp = [
@@ -633,28 +710,38 @@ def convert(
             maybe_cleanup()
 
         if value.get("clip") is not None:
-            # val1 = value["clip"][0]
-            # val2 = value["clip"][1]
-            # print(f"Clipping to {val1} - {val2}")
             image = np.clip(image, value["clip"][0], value["clip"][1])
             image = normalize(image, 0, 100)
 
         # Adjust intensity.
-        image *= value["intensity"]
-
+        if use_subtractive_method:
+            image *= 0.6 * (value["intensity"])
+        else:
+            image *= value["intensity"]
+            
+        # print(f"key {key}")
+        # print(f"value {value}")
+        
         # Calculate exponential attenuation.
         color = (
-            np.array([value["color"]["R"], value["color"]["G"], value["color"]["B"]])
-            / 255.0
+            np.array([value["color"]["R"], value["color"]["G"], value["color"]["B"]]) / 255.0
         )
-        absorption = background_color - color
-        transmission *= np.exp(
-            -absorption[np.newaxis, np.newaxis, np.newaxis, :] * image[..., np.newaxis]
-        )
+        component_color = background_color - color
+        
+        if use_subtractive_method:
+            transmission -= (
+                component_color[np.newaxis, np.newaxis, np.newaxis, :] * image[..., np.newaxis]
+            )
+        else:
+            transmission *= np.exp(
+                -component_color[np.newaxis, np.newaxis, np.newaxis, :] * image[..., np.newaxis]
+            )
+        
         # Delete image after using it.
         del image
         maybe_cleanup()
 
+    
     # Apply the computed transmission to base_image.
     def apply_exponential(i):
         base_image[..., i] = transmission[..., i]
@@ -695,6 +782,11 @@ def convert(
     # Apply AI enhancement if requested.
     if AI_enhancement:
         print("Enhancing image")
+        try:
+            from .enhancement import EnhanceBrightfield
+        except ImportError:
+            from enhancement import EnhanceBrightfield
+        
         base_image_uint8 = np.squeeze(base_image_uint8, axis=0)
         base_image_uint8 = EnhanceBrightfield(base_image_uint8)
         base_image_uint8 = np.expand_dims(base_image_uint8, axis=0)
@@ -768,6 +860,7 @@ def process_single_tile(
     height,
     width,
     filename,
+    n_z,
     n_channels,
     channel_names,
     config,
@@ -777,76 +870,67 @@ def process_single_tile(
     output_pixel_size_y,
     multi_page,
 ):
-    """
-    Process a single tile from a multiplex image.
+    import tifffile
+    import numpy as np
+    import math
+    import gc
 
-    This function computes the corresponding input region for an output tile based on scaling factors, 
-    reads the relevant data from the TIFF file, and processes the tile to produce a virtual brightfield 
-    image segment. If necessary, the resulting tile is cropped or padded to match the target dimensions.
-
-    Args:
-        tx (int): The x-index of the tile within the output grid.
-        ty (int): The y-index of the tile within the output grid.
-        tile_size (int): The pixel size of each output tile.
-        height (int): The height of the input image.
-        width (int): The width of the input image.
-        filename (str): Path to the input TIFF file.
-        n_channels (int): Number of channels in the input image.
-        channel_names (list of str): List of channel names from the input image.
-        config (dict): Configuration dictionary for stain simulation.
-        norm_values (dict): Normalization values computed from a center crop of the image.
-        pixel_sizes (dict): Dictionary containing pixel sizes (e.g., {"x": float, "y": float, "z": float}).
-        output_pixel_size_x (float): Desired output pixel size in the X direction.
-        output_pixel_size_y (float): Desired output pixel size in the Y direction.
-        multi_page (bool): Whether the TIFF file contains multiple pages representing separate channels.
-
-    Returns:
-        numpy.ndarray: The processed tile data as an array with shape (3, tile_height, tile_width).
-    """
-    
     scale_x = pixel_sizes["x"] / output_pixel_size_x
     scale_y = pixel_sizes["y"] / output_pixel_size_y
 
     y_start_out = ty * tile_size
     x_start_out = tx * tile_size
 
-    scaled_height = int(round(height * scale_y))
-    scaled_width = int(round(width * scale_x))
+    # Use ceil to match the same logic as convert_from_file
+    scaled_height = math.ceil(height * scale_y)
+    scaled_width  = math.ceil(width  * scale_x)
+
     y_end_out = min((ty + 1) * tile_size, scaled_height)
     x_end_out = min((tx + 1) * tile_size, scaled_width)
     target_height = y_end_out - y_start_out
-    target_width = x_end_out - x_start_out
+    target_width  = x_end_out - x_start_out
 
     input_y_start = int(math.floor(y_start_out / scale_y))
     input_x_start = int(math.floor(x_start_out / scale_x))
-    input_y_end = int(math.ceil(min(y_end_out, scaled_height) / scale_y))
-    input_x_end = int(math.ceil(min(x_end_out, scaled_width) / scale_x))
+    input_y_end   = int(math.ceil(min(y_end_out, scaled_height) / scale_y))
+    input_x_end   = int(math.ceil(min(x_end_out,  scaled_width)  / scale_x))
 
     if input_y_end <= input_y_start or input_x_end <= input_x_start:
-        return np.zeros((3, target_height, target_width), dtype=np.uint8)
+        return np.zeros((n_z, 3, target_height, target_width), dtype=np.uint8)
 
     try:
-        channels = []
-        with tifffile.TiffFile(filename) as tif:
-            if multi_page:
-                for i in range(n_channels):
-                    arr = tif.pages[i].asarray()[
-                        input_y_start:input_y_end, input_x_start:input_x_end
-                    ]
-                    if arr.ndim == 3 and arr.shape[2] == 1:
-                        arr = np.squeeze(arr, axis=2)
-                    channels.append(arr)
-            else:
-                arr = tif.pages[0].asarray()[
-                    input_y_start:input_y_end, input_x_start:input_x_end
-                ]
-                if arr.ndim == 3 and arr.shape[2] == 1:
-                    arr = np.squeeze(arr, axis=2)
-                for i in range(n_channels):
-                    channels.append(arr[..., i])
+        used_channel_indices = list(range(n_channels))
+        tile_channels = []
 
-        tile = np.stack(channels, axis=0)
-        tile = np.expand_dims(tile, axis=0)
+        with tifffile.TiffFile(filename) as tif:
+            shape = tif.series[0].shape
+
+            for z in range(n_z):
+                z_channels = []
+                for c in used_channel_indices:
+                    if len(shape) == 4:  # (Z, C, Y, X)
+                        page_index = z * n_channels + c
+                    elif len(shape) == 3:  # (C, Y, X)
+                        page_index = c
+                    else:
+                        raise ValueError(f"Unsupported TIFF shape: {shape}")
+
+                    try:
+                        crop = tif.pages[page_index].asarray(
+                            key=(slice(input_y_start, input_y_end), slice(input_x_start, input_x_end))
+                        )
+                    except Exception:
+                        full_channel = tif.pages[page_index].asarray()
+                        crop = full_channel[input_y_start:input_y_end, input_x_start:input_x_end]
+                        del full_channel
+
+                    z_channels.append(crop)
+                    del crop
+                    gc.collect()
+
+                tile_channels.append(np.stack(z_channels, axis=0))  # (C, H, W)
+
+        tile = np.stack(tile_channels, axis=0)  # (Z, C, H, W)
 
         processed = convert(
             tile,
@@ -861,25 +945,27 @@ def process_single_tile(
             normalization_values=norm_values,
             AI_enhancement=False,
         )
-        result = processed[0].copy()  # shape (3, tile_h, tile_w)
 
-        res_h, res_w = result.shape[1], result.shape[2]
-        if res_h != target_height or res_w != target_width:
-            if res_h > target_height:
-                result = result[:, :target_height, :]
-            elif res_h < target_height:
-                pad_h = target_height - res_h
-                result = np.pad(result, ((0, 0), (0, pad_h), (0, 0)), mode="constant")
-            if res_w > target_width:
-                result = result[:, :, :target_width]
-            elif res_w < target_width:
-                pad_w = target_width - res_w
-                result = np.pad(result, ((0, 0), (0, 0), (0, pad_w)), mode="constant")
+        # Allocate output at nominal size and safely copy data
+        result = np.zeros(
+            (n_z, 3, target_height, target_width),
+            dtype=processed.dtype,
+        )
 
-        del processed, tile, channels
-        maybe_cleanup()
-        return result
+        for z in range(n_z):
+            tile_rgb = processed[z]  # (3, H_real, W_real)
+
+            h = min(tile_rgb.shape[1], target_height)
+            w = min(tile_rgb.shape[2], target_width)
+
+            result[z, :, :h, :w] = tile_rgb[:, :h, :w]
+
+        del processed, tile, tile_channels
+        gc.collect()
+
+        return result  # (Z, 3, H, W)
 
     except Exception as e:
-        print(f"Error processing tile at ({tx}, {ty}): {e}")
+        print(f"Error processing tile at (tx={tx}, ty={ty}): {e}")
         raise
+

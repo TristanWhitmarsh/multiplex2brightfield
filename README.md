@@ -35,7 +35,7 @@ pip install multiplex2brightfield
 ### Basic Conversion (Virtual H&E)
 
 ```python
-from multiplex2brightfield import convert
+from multiplex2brightfield import convert_from_file
 
 # Input and output file paths
 input_filename = "path/to/your/input_image.ome.tiff"
@@ -43,7 +43,7 @@ output_filename = "path/to/your/output_virtual_HE.ome.tiff"
 
 # This assumes your input OME-TIFF has channel names identifiable
 # by the default H&E configuration in configuration_presets.py
-convert(
+convert_from_file(
     input_filename=input_filename,
     output_filename=output_filename,
     stain="H&E", # Specify the desired stain preset
@@ -56,7 +56,7 @@ print(f"Virtual H&E image saved to {output_filename}")
 ### Advanced Conversion (Virtual Masson Trichrome with AI Enhancement & LLM Mapping)
 
 ```python
-from multiplex2brightfield import convert
+from multiplex2brightfield import convert_from_file
 from matplotlib import pyplot as plt
 
 # Input and output file paths
@@ -93,7 +93,7 @@ config = {
     },
 }
 
-result = convert(
+result = convert_from_file(
     input_filename=input_filename,
     output_filename=output_filename,
     config = config, # Specify config for LLM to complete

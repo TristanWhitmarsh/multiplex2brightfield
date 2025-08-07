@@ -3,8 +3,13 @@ import os
 import numpy as np
 import requests
 from tqdm import tqdm
-from utils import maybe_cleanup
-
+try:
+    from .utils import maybe_cleanup
+except ImportError:
+    from utils import maybe_cleanup
+import tensorflow.keras.backend as K, gc
+import tensorflow as tf
+os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 def download_model():
     """
@@ -84,7 +89,9 @@ def process_tile(tile, model):
     tile = np.expand_dims(tile, 0)
 
     # Generate the image using the model
-    gen_tile = model.predict(tile, verbose=0)
+    # gen_tile = model.predict(tile, verbose=0)
+    tile_tensor = tf.convert_to_tensor(tile, dtype=tf.float32)
+    gen_tile = model(tile_tensor, training=False).numpy()
 
     # Post-process the generated tile
     gen_tile = gen_tile[0]
@@ -117,7 +124,7 @@ def process_image_with_tiling(image, model, tile_size=256, step_size=128):
     """
     h, w, _ = image.shape
     processed_image = np.zeros((h, w, 3))
-
+    tile_count = 0
     for y in range(0, h - tile_size + 1, step_size):
         for x in range(0, w - tile_size + 1, step_size):
             # Extract tile
@@ -141,8 +148,9 @@ def process_image_with_tiling(image, model, tile_size=256, step_size=128):
             # Delete temporary variables to free memory.
             del tile, processed_tile, processed_center
             # Optionally, trigger garbage collection every few iterations.
-            # gc.collect()  # (Be cautious: too frequent calls may slow down performance.)
+            tile_count += 1
 
+    gc.collect()
     return processed_image.astype(np.uint8)
 
 

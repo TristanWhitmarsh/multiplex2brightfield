@@ -110,7 +110,7 @@ def query_llm_for_channels(
         f"Double-check your response for accuracy and consistency including the slected markers and colors. Return your answer as the completed JSON object according to the template"
     )
 
-    print(prompt)
+    # print(prompt)
 
     # (The following code assumes the appropriate client libraries are installed and configured.)
     if use_chatgpt:
@@ -139,7 +139,7 @@ def query_llm_for_channels(
         #         )
 
         json_string = completion.choices[0].message.content
-        print(json_string)
+        # print(json_string)
         try:
             data = json.loads(json_string)
         except json.JSONDecodeError:

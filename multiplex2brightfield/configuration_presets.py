@@ -251,6 +251,7 @@ def GetConfiguration(name=None):
                     "P-cadherin",
                     "P-cad",
                     "CDX-2",
+                    "WGA-A594",
                 ],
             },
             "erythrocytes": {
